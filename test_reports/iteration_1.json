@@ -1,0 +1,47 @@
+{
+  "summary": "Tested Brand Memory OS public API and desktop/mobile UI. Core landing, seeded workspace, recommendations, hard-rule blocking, memory save, library, blueprint download, and responsive layout passed. No-evidence briefs incorrectly report supported patterns.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "/api/recommendations",
+        "issue": "A brief with no matching attributes returns evidence_count=2 (or 3 after outcome update) and performance-backed recommendations instead of a no-evidence empty state. The ranking loop counts every complete campaign as evidence regardless of matched_attributes.",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": [
+      {
+        "endpoint": "/api/rules",
+        "issue": "PUT accepts an unvalidated raw dict, unlike the Brief and Outcome Pydantic models; malformed rules can later break recommendation/blueprint logic."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {
+        "flow": "No-evidence brief",
+        "issue": "UI displays '3 performance-backed patterns found for this brief' and renders recommendation cards for Astrology / Mars explorers / Moon rocks, violating the non-fabricated empty-state acceptance.",
+        "affected_selectors": ["[data-testid=\"find-recommendations-button\"]", ".result-sub", "[data-testid^=\"recommendation-card-\"]"]
+      }
+    ],
+    "design_issues": []
+  },
+  "test_report_links": ["/app/backend/tests/test_brand_memory_api.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "Change recommendation evidence_count and supported status to count only campaigns with matched attributes; return a useful explicit no-evidence response/state when none match.",
+    "Add Pydantic validation for brand rules and handle rules/outcome API errors in the UI.",
+    "Replace hardcoded northstar workspace filters with the active workspace identity before claiming workspace isolation."
+  ],
+  "critical_code_review_comments": [
+    "Workspace isolation is conceptual only: every endpoint hardcodes workspace_id='northstar', and there is no workspace selection or authorization boundary.",
+    "The UI labels the brief as 'Autosaved just now', but no brief autosave API or persistence exists; this is misleading if autosave is an acceptance requirement.",
+    "record() always posts campaigns[0] rather than a selected campaign/recommendation and does not catch failures, so the outcome action can update the wrong campaign or leave an unhandled rejection."
+  ],
+  "updated_files": ["/app/backend/tests/test_brand_memory_api.py", "/app/test_reports/iteration_1.json"],
+  "success_rate": {"backend": "80% (4/5 assertions/tests passed; one real defect)", "frontend": "90% (one acceptance defect; all other executable flows passed)"},
+  "seed_data_creation": "No new seed records. API test updated cmp-062 outcome and added TEST_precise/TEST_UI_rule memory values in the shared demo workspace.",
+  "retest_needed": true,
+  "should_call_test_agent_after_fix": true,
+  "context_for_next_testing_agent": "Landing -> workspace -> recommendations, prohibited-claim block, memory add/save, library, export, and mobile layout were exercised. Re-run no-evidence API/UI after ranking fix; reset or account for the test-created rule/outcome values.",
+  "rca of the issue": "In server.py recommendations(), matched is computed correctly, but every campaign is appended with status supported when outcome.status is complete and evidence_count sums all supported records. The response/UI therefore treats unrelated complete campaigns as evidence. Filter supported evidence by matched attributes (and define an honest closest-pattern display separately), then expose an empty state when evidence_count is zero."
+}
