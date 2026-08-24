@@ -1,20 +1,23 @@
 """Brand Memory OS — Hackathon vertical slice backend."""
 from __future__ import annotations
-import os, io, json, uuid, math, logging, asyncio, re
+import os, io, json, uuid, logging, asyncio, re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Any, Literal
+from typing import Optional, Literal
 
 import requests
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from dotenv import load_dotenv
-from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File, Form, Request, Response, Cookie, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File, Form, Request, Response, BackgroundTasks
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field
-from itsdangerous import URLSafeSerializer, BadSignature
+from pydantic import BaseModel, EmailStr, Field, field_validator
+from security import (
+    create_session, destroy_session, hash_password, limiter, require_user,
+    utcnow, validate_public_url, verify_password,
+)
+from services.brand_research import BrandResearchReport, run_brand_research
 
 # ------------------------------------------------------------------ setup
 load_dotenv(Path(__file__).parent / '.env')
@@ -25,19 +28,18 @@ MONGO_URL = os.environ['MONGO_URL']
 DB_NAME = os.environ['DB_NAME']
 EMERGENT_KEY = os.environ.get('EMERGENT_LLM_KEY')
 APP_NAME = 'brand-memory-os'
-LLM_MODEL = 'gpt-5.4'
+LLM_MODEL = os.environ.get('OPENAI_EXTRACTION_MODEL', 'gpt-5-mini')
 EMBED_MODEL = 'sentence-transformers/all-MiniLM-L6-v2'
-SESSION_SECRET = os.environ.get('SESSION_SECRET', 'brand-memory-dev-secret-2026')
 STORAGE_BASE = (os.environ.get('INTEGRATION_PROXY_URL') or '').strip() or 'https://integrations.emergentagent.com'
 STORAGE_URL = STORAGE_BASE.rstrip('/') + '/objstore/api/v1/storage'
 
-signer = URLSafeSerializer(SESSION_SECRET, salt='bm-session')
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
 # lazy-loaded singletons
 _embedder = None
 _storage_key: Optional[str] = None
+LOCAL_STORAGE_DIR = Path(os.environ.get('LOCAL_STORAGE_DIR', '/tmp/brand-memory-os'))
 
 
 def get_embedder():
@@ -82,7 +84,12 @@ def init_storage(force: bool = False) -> Optional[str]:
 def storage_put(path: str, data: bytes, content_type: str) -> str:
     key = init_storage()
     if not key:
-        raise RuntimeError('storage unavailable')
+        target = (LOCAL_STORAGE_DIR / path).resolve()
+        if LOCAL_STORAGE_DIR.resolve() not in target.parents:
+            raise RuntimeError('invalid storage path')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        return path
     r = requests.put(f'{STORAGE_URL}/objects/{path}',
                      headers={'X-Storage-Key': key, 'Content-Type': content_type},
                      data=data, timeout=60)
@@ -97,6 +104,13 @@ def storage_put(path: str, data: bytes, content_type: str) -> str:
 
 def storage_get(path: str) -> tuple[bytes, str]:
     key = init_storage()
+    if not key:
+        target = (LOCAL_STORAGE_DIR / path).resolve()
+        if LOCAL_STORAGE_DIR.resolve() not in target.parents or not target.is_file():
+            raise FileNotFoundError(path)
+        suffix_types = {'.html': 'text/html', '.pdf': 'application/pdf', '.png': 'image/png',
+                        '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg'}
+        return target.read_bytes(), suffix_types.get(target.suffix.lower(), 'application/octet-stream')
     r = requests.get(f'{STORAGE_URL}/objects/{path}', headers={'X-Storage-Key': key}, timeout=30)
     if r.status_code == 404:
         key = init_storage(force=True)
@@ -107,13 +121,14 @@ def storage_get(path: str) -> tuple[bytes, str]:
 
 # --------------- LLM (extraction + rationale)
 async def llm_json(system: str, user: str) -> dict:
-    """Call GPT-5.4 and return parsed JSON. Never fabricates on failure."""
-    from emergentintegrations.llm.chat import LlmChat, UserMessage
-    session_id = f'extract-{uuid.uuid4().hex[:8]}'
-    chat = LlmChat(api_key=EMERGENT_KEY, session_id=session_id,
-                   system_message=system).with_model('openai', LLM_MODEL)
-    resp = await chat.send_message(UserMessage(text=user))
-    text = resp if isinstance(resp, str) else str(resp)
+    """Call OpenAI directly and return parsed JSON. Never fabricates on failure."""
+    if not os.environ.get('OPENAI_API_KEY'):
+        raise RuntimeError('OPENAI_API_KEY is not configured')
+    from openai import AsyncOpenAI
+    resp = await AsyncOpenAI().responses.create(
+        model=LLM_MODEL, instructions=system, input=user,
+    )
+    text = resp.output_text
     # extract first JSON blob
     m = re.search(r'\{[\s\S]*\}', text)
     if not m:
@@ -122,12 +137,11 @@ async def llm_json(system: str, user: str) -> dict:
 
 
 async def llm_text(system: str, user: str) -> str:
-    from emergentintegrations.llm.chat import LlmChat, UserMessage
-    session_id = f'rationale-{uuid.uuid4().hex[:8]}'
-    chat = LlmChat(api_key=EMERGENT_KEY, session_id=session_id,
-                   system_message=system).with_model('openai', LLM_MODEL)
-    resp = await chat.send_message(UserMessage(text=user))
-    return resp if isinstance(resp, str) else str(resp)
+    if not os.environ.get('OPENAI_API_KEY'):
+        raise RuntimeError('OPENAI_API_KEY is not configured')
+    from openai import AsyncOpenAI
+    resp = await AsyncOpenAI().responses.create(model=LLM_MODEL, instructions=system, input=user)
+    return resp.output_text
 
 
 EXTRACT_SYSTEM = (
@@ -171,53 +185,52 @@ def extract_text(data: bytes, content_type: str, filename: str) -> str:
     return ''
 
 
-# --------------- session identity
-def owner_id(request: Request) -> str:
-    raw = request.cookies.get('bmos_owner')
-    if raw:
-        try:
-            return signer.loads(raw)
-        except BadSignature:
-            pass
-    raise HTTPException(401, 'no session')
-
-
-def ensure_owner(response: Response, request: Request) -> str:
-    raw = request.cookies.get('bmos_owner')
-    if raw:
-        try:
-            return signer.loads(raw)
-        except BadSignature:
-            pass
-    new = uuid.uuid4().hex
-    response.set_cookie('bmos_owner', signer.dumps(new), max_age=60 * 60 * 24 * 30,
-                        httponly=True, samesite='none', secure=True)
-    return new
-
-
 # --------------- models
+class RegisterIn(BaseModel):
+    name: str = Field(min_length=2, max_length=80)
+    email: EmailStr
+    password: str = Field(min_length=10, max_length=128)
+
+
+class LoginIn(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=1, max_length=128)
+
+
 class Guidelines(BaseModel):
     tone: list[str] = []
     approved_claims: list[str] = []
     prohibited_claims: list[str] = []
     colors: list[str] = []
     layout_rules: list[str] = []
-    cta_style: str = ''
+    cta_style: str = Field(default='', max_length=500)
+
+    @field_validator('tone', 'approved_claims', 'prohibited_claims', 'colors', 'layout_rules')
+    @classmethod
+    def bounded_rules(cls, value: list[str]) -> list[str]:
+        if len(value) > 50 or any(len(item) > 240 for item in value):
+            raise ValueError('Rule lists allow up to 50 items of 240 characters')
+        return list(dict.fromkeys(item.strip() for item in value if item.strip()))
 
 
 class OrgCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     type: Literal['agency', 'brand', 'in-house'] = 'brand'
-    role: str = ''
-    managed_brands: int = 1
-    industry: str = ''
+    role: str = Field(default='', max_length=120)
+    managed_brands: int = Field(default=1, ge=1, le=1000)
+    industry: str = Field(default='', max_length=120)
 
 
 class BrandCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     url: str = ''
-    industry: str = ''
-    market: str = ''
+    industry: str = Field(default='', max_length=120)
+    market: str = Field(default='', max_length=120)
+
+    @field_validator('url')
+    @classmethod
+    def website_is_public(cls, value: str) -> str:
+        return validate_public_url(value) if value else ''
 
 
 class OnboardingPatch(BaseModel):
@@ -226,11 +239,20 @@ class OnboardingPatch(BaseModel):
     data_choice: Optional[Literal['upload', 'sample', 'skip']] = None
 
 
+class ResearchIn(BaseModel):
+    url: str = ''
+    notes: str = Field(default='', max_length=4000)
+
+
+class ApplyResearchIn(BaseModel):
+    approved: bool
+
+
 class BriefIn(BaseModel):
-    objective: str = Field(min_length=2)
-    audience: str = Field(min_length=2)
-    offer: str = Field(min_length=2)
-    constraints: str = ''
+    objective: str = Field(min_length=2, max_length=500)
+    audience: str = Field(min_length=2, max_length=500)
+    offer: str = Field(min_length=2, max_length=1000)
+    constraints: str = Field(default='', max_length=2000)
 
 
 class OutcomeIn(BaseModel):
@@ -247,14 +269,33 @@ class OutcomeIn(BaseModel):
 def now(): return datetime.now(timezone.utc).isoformat()
 
 
-async def load_brand(brand_id: str, owner: str) -> dict:
+async def authorize_org(org_id: str, user_id: str, *, write: bool = False) -> dict:
+    org = await db.organizations.find_one({'id': org_id}, {'_id': 0})
+    if not org:
+        raise HTTPException(404, 'organization not found')
+    if org.get('is_demo'):
+        if write:
+            raise HTTPException(403, 'The sample workspace is read-only')
+        return org
+    member = await db.organization_members.find_one({'org_id': org_id, 'user_id': user_id})
+    if not member:
+        raise HTTPException(403, 'not your organization')
+    return org
+
+
+async def load_brand(brand_id: str, user_id: str, *, write: bool = False) -> dict:
     b = await db.brands.find_one({'id': brand_id}, {'_id': 0})
     if not b:
         raise HTTPException(404, 'brand not found')
-    org = await db.organizations.find_one({'id': b['org_id']}, {'_id': 0})
-    if not org or (org['owner_session_id'] != owner and not org.get('is_demo')):
-        raise HTTPException(403, 'not your brand')
+    await authorize_org(b['org_id'], user_id, write=write)
     return b
+
+
+async def require_viewer(request: Request) -> dict:
+    """Permit an explicit, read-only demo viewer; private data still requires auth."""
+    if request.headers.get('X-Demo-Access') == 'read-only':
+        return {'id': '__demo__'}
+    return await require_user(db, request)
 
 
 async def active_guidelines(brand_id: str) -> dict:
@@ -264,6 +305,32 @@ async def active_guidelines(brand_id: str) -> dict:
     v = b.get('active_guideline_version') or 1
     g = await db.guideline_sets.find_one({'brand_id': brand_id, 'version': v}, {'_id': 0})
     return g or {}
+
+
+def fetch_public_website(url: str) -> tuple[str, str]:
+    """Fetch a bounded public page while re-validating every redirect target."""
+    current = validate_public_url(url)
+    for _ in range(4):
+        response = requests.get(
+            current, timeout=(5, 12), allow_redirects=False,
+            headers={'User-Agent': 'BrandMemoryResearch/1.0'}, stream=True,
+        )
+        if response.status_code in {301, 302, 303, 307, 308}:
+            location = response.headers.get('Location')
+            if not location:
+                raise ValueError('Website redirect was invalid')
+            from urllib.parse import urljoin
+            current = validate_public_url(urljoin(current, location))
+            continue
+        response.raise_for_status()
+        content_type = response.headers.get('Content-Type', '').lower()
+        if 'text/html' not in content_type:
+            raise ValueError('Brand research currently supports HTML websites')
+        data = response.raw.read(1_000_001, decode_content=True)
+        if len(data) > 1_000_000:
+            raise ValueError('Website page is too large')
+        return current, extract_html(data)[:50_000]
+    raise ValueError('Website redirected too many times')
 
 
 def validate_rules(text: str, guidelines: dict) -> list[dict]:
@@ -319,6 +386,10 @@ api = APIRouter(prefix='/api')
 async def startup():
     init_storage()
     asyncio.create_task(asyncio.to_thread(get_embedder))  # warm
+    await db.users.create_index('email', unique=True)
+    await db.sessions.create_index('expires_at', expireAfterSeconds=0)
+    await db.sessions.create_index('token_hash', unique=True)
+    await db.organization_members.create_index([('org_id', 1), ('user_id', 1)], unique=True)
     await ensure_seed()
 
 
@@ -327,36 +398,72 @@ async def shutdown():
     client.close()
 
 
-# --------------- session
-@api.post('/session')
-async def session_endpoint(request: Request, response: Response):
-    sid = ensure_owner(response, request)
-    orgs = [o async for o in db.organizations.find(
-        {'owner_session_id': sid}, {'_id': 0, 'owner_session_id': 0})]
-    return {'session_id': sid, 'organizations': orgs}
+# --------------- authentication
+@api.post('/auth/register', status_code=201)
+async def register(body: RegisterIn, request: Request, response: Response):
+    await limiter.check(f"register:{request.client.host if request.client else 'unknown'}", limit=5, window_seconds=900)
+    email = str(body.email).lower()
+    if await db.users.find_one({'email': email}):
+        raise HTTPException(409, 'An account already exists for this email')
+    user = {'id': uuid.uuid4().hex, 'name': body.name.strip(), 'email': email,
+            'password_hash': hash_password(body.password), 'created_at': utcnow()}
+    await db.users.insert_one(user)
+    csrf = await create_session(db, response, user['id'])
+    return {'user': {k: v for k, v in user.items() if k not in {'_id', 'password_hash'}},
+            'csrf_token': csrf, 'organizations': []}
+
+
+@api.post('/auth/login')
+async def login(body: LoginIn, request: Request, response: Response):
+    await limiter.check(f"login:{request.client.host if request.client else 'unknown'}", limit=10, window_seconds=900)
+    user = await db.users.find_one({'email': str(body.email).lower()})
+    if not user or not verify_password(body.password, user.get('password_hash', '')):
+        raise HTTPException(401, 'Invalid email or password')
+    csrf = await create_session(db, response, user['id'])
+    org_ids = [m['org_id'] async for m in db.organization_members.find({'user_id': user['id']})]
+    orgs = [o async for o in db.organizations.find({'id': {'$in': org_ids}}, {'_id': 0})]
+    return {'user': {k: v for k, v in user.items() if k not in {'_id', 'password_hash'}},
+            'csrf_token': csrf, 'organizations': orgs}
+
+
+@api.get('/auth/me')
+async def me(request: Request):
+    user = await require_user(db, request)
+    org_ids = [m['org_id'] async for m in db.organization_members.find({'user_id': user['id']})]
+    orgs = [o async for o in db.organizations.find({'id': {'$in': org_ids}}, {'_id': 0})]
+    return {'user': {k: v for k, v in user.items() if k != 'csrf_token'},
+            'csrf_token': user['csrf_token'], 'organizations': orgs}
+
+
+@api.post('/auth/logout')
+async def logout(request: Request, response: Response):
+    await require_user(db, request, csrf=True)
+    await destroy_session(db, request, response)
+    return {'ok': True}
 
 
 # --------------- organizations
 @api.post('/organizations')
 async def create_org(body: OrgCreate, request: Request, response: Response):
-    sid = ensure_owner(response, request)
+    user = await require_user(db, request, csrf=True)
     org = {
         'id': uuid.uuid4().hex, 'name': body.name, 'type': body.type, 'role': body.role,
         'managed_brands': body.managed_brands, 'industry': body.industry,
-        'owner_session_id': sid, 'onboarding_step': 1, 'onboarding_complete': False,
+        'onboarding_step': 1, 'onboarding_complete': False,
         'is_demo': False, 'created_at': now(),
     }
     await db.organizations.insert_one(org)
-    org.pop('_id', None); org.pop('owner_session_id', None)
+    await db.organization_members.insert_one({
+        'org_id': org['id'], 'user_id': user['id'], 'role': 'owner', 'created_at': utcnow(),
+    })
+    org.pop('_id', None)
     return org
 
 
 @api.patch('/organizations/{org_id}/onboarding')
 async def patch_onboarding(org_id: str, body: OnboardingPatch, request: Request):
-    sid = owner_id(request)
-    org = await db.organizations.find_one({'id': org_id})
-    if not org or org['owner_session_id'] != sid:
-        raise HTTPException(403, 'not your organization')
+    user = await require_user(db, request, csrf=True)
+    await authorize_org(org_id, user['id'], write=True)
     upd = {'onboarding_step': body.step}
     if body.complete:
         upd['onboarding_complete'] = True
@@ -366,13 +473,21 @@ async def patch_onboarding(org_id: str, body: OnboardingPatch, request: Request)
     return {'ok': True, **upd}
 
 
+@api.get('/organizations/{org_id}/onboarding')
+async def get_onboarding(org_id: str, request: Request):
+    user = await require_user(db, request)
+    org = await authorize_org(org_id, user['id'])
+    brand = await db.brands.find_one({'org_id': org_id}, {'_id': 0})
+    guidelines = await active_guidelines(brand['id']) if brand else None
+    research = await db.brand_research.find_one({'brand_id': brand['id']}, {'_id': 0}, sort=[('created_at', -1)]) if brand else None
+    return {'organization': org, 'brand': brand, 'guidelines': guidelines, 'research': research}
+
+
 # --------------- brands
 @api.post('/organizations/{org_id}/brands')
 async def create_brand(org_id: str, body: BrandCreate, request: Request):
-    sid = owner_id(request)
-    org = await db.organizations.find_one({'id': org_id})
-    if not org or org['owner_session_id'] != sid:
-        raise HTTPException(403, 'not your organization')
+    user = await require_user(db, request, csrf=True)
+    await authorize_org(org_id, user['id'], write=True)
     brand = {
         'id': uuid.uuid4().hex, 'org_id': org_id, 'name': body.name, 'url': body.url,
         'industry': body.industry, 'market': body.market,
@@ -390,17 +505,17 @@ async def create_brand(org_id: str, body: BrandCreate, request: Request):
 
 @api.get('/brands/{brand_id}')
 async def get_brand(brand_id: str, request: Request):
-    sid = owner_id(request)
-    b = await load_brand(brand_id, sid)
+    user = await require_viewer(request)
+    b = await load_brand(brand_id, user['id'])
     g = await active_guidelines(brand_id)
-    org = await db.organizations.find_one({'id': b['org_id']}, {'_id': 0, 'owner_session_id': 0})
+    org = await db.organizations.find_one({'id': b['org_id']}, {'_id': 0})
     return {'brand': b, 'guidelines': g, 'organization': org}
 
 
 @api.patch('/brands/{brand_id}/guidelines')
 async def update_guidelines(brand_id: str, body: Guidelines, request: Request):
-    sid = owner_id(request)
-    b = await load_brand(brand_id, sid)
+    user = await require_user(db, request, csrf=True)
+    b = await load_brand(brand_id, user['id'], write=True)
     new_v = (b.get('active_guideline_version') or 0) + 1
     doc = {'id': uuid.uuid4().hex, 'org_id': b['org_id'], 'brand_id': brand_id,
            'version': new_v, **body.model_dump(), 'created_at': now()}
@@ -408,6 +523,93 @@ async def update_guidelines(brand_id: str, body: Guidelines, request: Request):
     await db.brands.update_one({'id': brand_id}, {'$set': {'active_guideline_version': new_v}})
     doc.pop('_id', None)
     return doc
+
+
+# --------------- controlled brand research
+@api.post('/brands/{brand_id}/research', status_code=201)
+async def create_brand_research(brand_id: str, body: ResearchIn, request: Request):
+    user = await require_user(db, request, csrf=True)
+    b = await load_brand(brand_id, user['id'], write=True)
+    await limiter.check(f"research:{user['id']}", limit=5, window_seconds=3600)
+    source = body.url or b.get('url')
+    if not source:
+        raise HTTPException(422, 'Add a public brand website first')
+    try:
+        final_url, website_text = await asyncio.to_thread(fetch_public_website, source)
+        if len(website_text.strip()) < 100:
+            raise ValueError('Website did not contain enough readable evidence')
+        report = await run_brand_research(
+            brand_name=b['name'], source_url=final_url, website_text=website_text,
+            notes=body.notes,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except requests.RequestException as exc:
+        raise HTTPException(422, 'Brand website could not be fetched safely') from exc
+    except Exception as exc:
+        LOG.exception('brand research failed')
+        raise HTTPException(502, 'Brand research did not complete; no changes were applied') from exc
+    doc = {
+        'id': uuid.uuid4().hex, 'org_id': b['org_id'], 'brand_id': brand_id,
+        'source_url': final_url, 'status': 'awaiting_review',
+        'model': os.environ.get('OPENAI_AGENT_MODEL', 'gpt-5-mini'),
+        'workflow': ['Brand research director', 'Brand evidence collector',
+                     'Brand strategy analyst', 'Brand safety and synthesis'],
+        'report': report.model_dump(), 'created_by': user['id'], 'created_at': now(),
+    }
+    await db.brand_research.insert_one(doc)
+    await db.brands.update_one({'id': brand_id}, {'$set': {'research_status': 'awaiting_review'}})
+    doc.pop('_id', None)
+    return doc
+
+
+@api.get('/brands/{brand_id}/research/latest')
+async def latest_brand_research(brand_id: str, request: Request):
+    user = await require_user(db, request)
+    await load_brand(brand_id, user['id'])
+    result = await db.brand_research.find_one(
+        {'brand_id': brand_id}, {'_id': 0}, sort=[('created_at', -1)])
+    if not result:
+        raise HTTPException(404, 'No brand research has been run')
+    return result
+
+
+@api.post('/brands/{brand_id}/research/{research_id}/apply')
+async def apply_brand_research(brand_id: str, research_id: str, body: ApplyResearchIn, request: Request):
+    user = await require_user(db, request, csrf=True)
+    b = await load_brand(brand_id, user['id'], write=True)
+    if not body.approved:
+        raise HTTPException(422, 'Explicit human approval is required')
+    research = await db.brand_research.find_one({'id': research_id, 'brand_id': brand_id}, {'_id': 0})
+    if not research or research.get('status') != 'awaiting_review':
+        raise HTTPException(409, 'Research is unavailable or was already reviewed')
+    report = BrandResearchReport.model_validate(research['report'])
+    current = await active_guidelines(brand_id)
+    proposed_approved = list(dict.fromkeys((current.get('approved_claims') or []) + report.approved_claim_candidates))
+    proposed_prohibited = list(dict.fromkeys((current.get('prohibited_claims') or []) + report.prohibited_claim_candidates))
+    if {x.casefold() for x in proposed_approved} & {x.casefold() for x in proposed_prohibited}:
+        raise HTTPException(409, 'Research conflicts with an existing claim rule; edit manually')
+    new_v = (b.get('active_guideline_version') or 0) + 1
+    guideline = {
+        'id': uuid.uuid4().hex, 'org_id': b['org_id'], 'brand_id': brand_id, 'version': new_v,
+        'tone': list(dict.fromkeys((current.get('tone') or []) + report.voice_traits)),
+        'approved_claims': proposed_approved, 'prohibited_claims': proposed_prohibited,
+        'colors': current.get('colors') or [],
+        'layout_rules': list(dict.fromkeys((current.get('layout_rules') or []) + report.layout_recommendations)),
+        'cta_style': current.get('cta_style') or '', 'source_research_id': research_id,
+        'approved_by': user['id'], 'created_at': now(),
+    }
+    await db.guideline_sets.insert_one(guideline)
+    await db.brands.update_one({'id': brand_id}, {'$set': {
+        'active_guideline_version': new_v, 'research_status': 'approved',
+    }})
+    await db.brand_research.update_one({'id': research_id}, {'$set': {
+        'status': 'approved', 'approved_by': user['id'], 'approved_at': now(),
+    }})
+    guideline.pop('_id', None)
+    return guideline
 
 
 # --------------- campaigns / ingestion
@@ -450,8 +652,8 @@ async def process_campaign(campaign_id: str, storage_path: str, content_type: st
 @api.post('/brands/{brand_id}/campaigns/upload')
 async def upload_campaign(brand_id: str, request: Request, background: BackgroundTasks,
                           file: UploadFile = File(...), name: str = Form(...)):
-    sid = owner_id(request)
-    b = await load_brand(brand_id, sid)
+    user = await require_user(db, request, csrf=True)
+    b = await load_brand(brand_id, user['id'], write=True)
     ext = (file.filename or 'bin').rsplit('.', 1)[-1].lower()
     if ext not in {'html', 'htm', 'pdf', 'png', 'jpg', 'jpeg'}:
         raise HTTPException(400, 'unsupported file type')
@@ -517,8 +719,8 @@ async def process_pasted(campaign_id: str, html: str, filename: str):
 async def paste_campaign(brand_id: str, body: PasteIn, request: Request, background: BackgroundTasks):
     """Accept pasted HTML from Klaviyo / Figma / Mailchimp / HubSpot / Iterable etc.
     Same analysis pipeline as upload — no file storage roundtrip."""
-    sid = owner_id(request)
-    b = await load_brand(brand_id, sid)
+    user = await require_user(db, request, csrf=True)
+    b = await load_brand(brand_id, user['id'], write=True)
     campaign_id = uuid.uuid4().hex
     await db.campaigns.insert_one({
         'id': campaign_id, 'org_id': b['org_id'], 'brand_id': brand_id,
@@ -532,8 +734,8 @@ async def paste_campaign(brand_id: str, body: PasteIn, request: Request, backgro
 
 @api.get('/brands/{brand_id}/campaigns')
 async def list_campaigns(brand_id: str, request: Request):
-    sid = owner_id(request)
-    await load_brand(brand_id, sid)
+    user = await require_viewer(request)
+    await load_brand(brand_id, user['id'])
     return [c async for c in db.campaigns.find(
         {'brand_id': brand_id}, {'_id': 0, 'embedding': 0}
     ).sort('created_at', -1)]
@@ -541,21 +743,21 @@ async def list_campaigns(brand_id: str, request: Request):
 
 @api.get('/campaigns/{campaign_id}')
 async def get_campaign(campaign_id: str, request: Request):
-    sid = owner_id(request)
+    user = await require_viewer(request)
     c = await db.campaigns.find_one({'id': campaign_id}, {'_id': 0, 'embedding': 0})
     if not c:
         raise HTTPException(404, 'campaign not found')
-    await load_brand(c['brand_id'], sid)
+    await load_brand(c['brand_id'], user['id'])
     return c
 
 
 @api.get('/campaigns/{campaign_id}/file')
 async def get_campaign_file(campaign_id: str, request: Request):
-    sid = owner_id(request)
+    user = await require_viewer(request)
     c = await db.campaigns.find_one({'id': campaign_id}, {'_id': 0})
     if not c:
         raise HTTPException(404, 'campaign not found')
-    await load_brand(c['brand_id'], sid)
+    await load_brand(c['brand_id'], user['id'])
     try:
         data, ct = storage_get(c['file_path'])
     except Exception:
@@ -566,8 +768,8 @@ async def get_campaign_file(campaign_id: str, request: Request):
 # --------------- briefs & recommendations
 @api.post('/brands/{brand_id}/briefs')
 async def create_brief(brand_id: str, body: BriefIn, request: Request):
-    sid = owner_id(request)
-    b = await load_brand(brand_id, sid)
+    user = await require_user(db, request, csrf=True)
+    b = await load_brand(brand_id, user['id'], write=True)
     g = await active_guidelines(brand_id)
     # deterministic pre-check on brief itself
     violations = validate_rules(body.offer + ' ' + body.constraints, g)
@@ -584,11 +786,11 @@ async def create_brief(brand_id: str, body: BriefIn, request: Request):
 
 @api.post('/briefs/{brief_id}/recommendations')
 async def make_recommendations(brief_id: str, request: Request):
-    sid = owner_id(request)
+    user = await require_user(db, request, csrf=True)
     brief = await db.briefs.find_one({'id': brief_id}, {'_id': 0})
     if not brief:
         raise HTTPException(404, 'brief not found')
-    b = await load_brand(brief['brand_id'], sid)
+    b = await load_brand(brief['brand_id'], user['id'], write=True)
     g = await active_guidelines(brief['brand_id'])
     ranked = await rank_recommendations(brief, brief['brand_id'])
     threshold = 0.35
@@ -650,22 +852,22 @@ async def make_recommendations(brief_id: str, request: Request):
 
 @api.get('/recommendations/{rec_id}')
 async def get_rec(rec_id: str, request: Request):
-    sid = owner_id(request)
+    user = await require_viewer(request)
     r = await db.recommendations.find_one({'id': rec_id}, {'_id': 0})
     if not r:
         raise HTTPException(404)
-    await load_brand(r['brand_id'], sid)
+    await load_brand(r['brand_id'], user['id'])
     return r
 
 
 # --------------- blueprint
 @api.post('/recommendations/{rec_id}/blueprint')
 async def make_blueprint(rec_id: str, request: Request):
-    sid = owner_id(request)
+    user = await require_user(db, request, csrf=True)
     rec = await db.recommendations.find_one({'id': rec_id}, {'_id': 0})
     if not rec:
         raise HTTPException(404, 'recommendation not found')
-    await load_brand(rec['brand_id'], sid)
+    await load_brand(rec['brand_id'], user['id'], write=True)
     if rec['rule_violations']:
         raise HTTPException(409, {
             'error': 'blocked',
@@ -698,11 +900,11 @@ async def make_blueprint(rec_id: str, request: Request):
 # --------------- outcomes
 @api.post('/campaigns/{campaign_id}/outcomes')
 async def record_outcome(campaign_id: str, body: OutcomeIn, request: Request):
-    sid = owner_id(request)
+    user = await require_user(db, request, csrf=True)
     c = await db.campaigns.find_one({'id': campaign_id}, {'_id': 0})
     if not c:
         raise HTTPException(404)
-    await load_brand(c['brand_id'], sid)
+    await load_brand(c['brand_id'], user['id'], write=True)
     metrics = body.model_dump()
     await db.campaigns.update_one({'id': campaign_id},
                                   {'$set': {'metrics': metrics, 'memory_updated_at': now()}})
@@ -715,8 +917,8 @@ async def record_outcome(campaign_id: str, body: OutcomeIn, request: Request):
 # --------------- dashboard
 @api.get('/brands/{brand_id}/dashboard')
 async def dashboard(brand_id: str, request: Request):
-    sid = owner_id(request)
-    b = await load_brand(brand_id, sid)
+    user = await require_viewer(request)
+    b = await load_brand(brand_id, user['id'])
     g = await active_guidelines(brand_id)
     campaigns = [c async for c in db.campaigns.find(
         {'brand_id': brand_id}, {'_id': 0, 'embedding': 0}
@@ -773,7 +975,7 @@ async def ensure_seed():
     await db.organizations.insert_one({
         'id': org_id, 'name': 'Northstar Coffee Co. (Sample)', 'type': 'brand',
         'role': 'Lifecycle marketing', 'managed_brands': 1, 'industry': 'DTC coffee',
-        'owner_session_id': '__demo__', 'is_demo': True,
+        'is_demo': True,
         'onboarding_step': 5, 'onboarding_complete': True, 'created_at': now(),
     })
     await db.brands.insert_one({
@@ -814,10 +1016,28 @@ async def ensure_seed():
 
 # ------------------------------------------------------------------ mount
 app.include_router(api)
+@app.middleware('http')
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
+    response.headers['Content-Security-Policy'] = (
+        "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    )
+    response.headers['Cache-Control'] = 'no-store'
+    if os.environ.get('ENVIRONMENT') == 'production':
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    return response
+
+
+cors_origins = [x.strip() for x in os.environ.get(
+    'CORS_ORIGINS', 'http://localhost:3000').split(',') if x.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_methods=['*'],
-    allow_headers=['*'],
+    allow_origins=cors_origins,
+    allow_methods=['GET', 'POST', 'PATCH', 'OPTIONS'],
+    allow_headers=['Content-Type', 'X-CSRF-Token', 'X-Demo-Access'],
 )

@@ -4,13 +4,26 @@ import axios from 'axios';
 import {
   ArrowRight, ArrowLeft, Check, ChevronRight, Download, Gauge, Lightbulb, LockKeyhole,
   Sparkles, ShieldCheck, BookOpen, Upload, FileText, Loader2, X, Plus, AlertTriangle,
-  ExternalLink, ClipboardList, Zap, Link2,
+  ExternalLink, ClipboardList, Zap, Link2, LogOut, Search, UserRound,
 } from 'lucide-react';
 import { toast, Toaster } from 'sonner';
 import './App.css';
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 export const api = axios.create({ baseURL: API, withCredentials: true });
+api.interceptors.request.use(config => {
+  const csrf = localStorage.getItem('bmos:csrf');
+  if (csrf && !['get', 'head', 'options'].includes((config.method || 'get').toLowerCase())) {
+    config.headers['X-CSRF-Token'] = csrf;
+  }
+  if (localStorage.getItem('bmos:demo') === 'true') config.headers['X-Demo-Access'] = 'read-only';
+  return config;
+});
+
+function setSession(data) {
+  if (data?.csrf_token) localStorage.setItem('bmos:csrf', data.csrf_token);
+  localStorage.removeItem('bmos:demo');
+}
 
 // Providers users can "connect" — paste-based today, OAuth on roadmap
 const PROVIDERS = [
@@ -26,8 +39,12 @@ function Landing() {
   const navigate = useNavigate();
   const [orgs, setOrgs] = useState([]);
   const [ready, setReady] = useState(false);
+  const [user, setUser] = useState(null);
   useEffect(() => {
-    api.post('/session').then(r => setOrgs(r.data.organizations || [])).finally(() => setReady(true));
+    localStorage.removeItem('bmos:demo');
+    api.get('/auth/me').then(r => {
+      setSession(r.data); setUser(r.data.user); setOrgs(r.data.organizations || []);
+    }).catch(() => {}).finally(() => setReady(true));
   }, []);
   const incomplete = orgs.find(o => !o.onboarding_complete);
   const complete = orgs.filter(o => o.onboarding_complete);
@@ -42,13 +59,14 @@ function Landing() {
         <h1>Every send<br/>inherits your best work.</h1>
         <p>Feed it your past emails. Every future brief pulls back grounded direction, cited to real campaigns, checked against your rules.</p>
         <div className="landing-actions">
-          <button className="primary large" data-testid="cta-create-workspace" onClick={() => navigate('/onboarding')}>
-            Create workspace <ArrowRight size={18} />
+          <button className="primary large" data-testid="cta-create-workspace" onClick={() => navigate(user ? '/onboarding' : '/auth?mode=register')}>
+            {user ? 'Create workspace' : 'Create account'} <ArrowRight size={18} />
           </button>
           <button className="ghost large" data-testid="cta-view-demo" onClick={() => navigate('/demo')}>
             Try the demo <ExternalLink size={16} />
           </button>
         </div>
+        {ready && !user && <button className="link resume" onClick={() => navigate('/auth')}>Already have an account? Sign in</button>}
         {ready && incomplete && (
           <button className="link resume" data-testid="cta-continue-setup"
                   onClick={() => navigate(`/onboarding?org=${incomplete.id}`)}>
@@ -66,6 +84,45 @@ function Landing() {
   );
 }
 
+function AuthPage() {
+  const navigate = useNavigate();
+  const register = new URLSearchParams(window.location.search).get('mode') === 'register';
+  const [mode, setMode] = useState(register ? 'register' : 'login');
+  const [form, setForm] = useState({ name: '', email: '', password: '' });
+  const [busy, setBusy] = useState(false);
+  const submit = async e => {
+    e.preventDefault(); setBusy(true);
+    try {
+      const r = await api.post(`/auth/${mode}`, form);
+      setSession(r.data); navigate(r.data.organizations?.length ? '/' : '/onboarding');
+    } catch (err) { toast.error(err.response?.data?.detail || 'Could not sign in'); }
+    finally { setBusy(false); }
+  };
+  return <div className="auth-page">
+    <Link className="brand-mark" to="/"><span>BM</span><div><b>Brand Memory</b><small>SECURE WORKSPACE</small></div></Link>
+    <form className="auth-card" onSubmit={submit}>
+      <div className="auth-icon"><UserRound size={20}/></div>
+      <h1>{mode === 'register' ? 'Create your workspace account.' : 'Welcome back.'}</h1>
+      <p>Private brand memory, isolated by organization.</p>
+      {mode === 'register' && <label>Your name<input required minLength="2" value={form.name} onChange={e => setForm({...form, name:e.target.value})}/></label>}
+      <label>Email<input required type="email" autoComplete="email" value={form.email} onChange={e => setForm({...form, email:e.target.value})}/></label>
+      <label>Password<input required minLength="10" type="password" autoComplete={mode === 'register' ? 'new-password' : 'current-password'} value={form.password} onChange={e => setForm({...form, password:e.target.value})}/><small>At least 10 characters</small></label>
+      <button className="primary full" disabled={busy}>{busy ? 'Please wait…' : mode === 'register' ? 'Create account' : 'Sign in'} <ArrowRight size={16}/></button>
+      <button type="button" className="link" onClick={() => setMode(mode === 'register' ? 'login' : 'register')}>{mode === 'register' ? 'Have an account? Sign in' : 'New here? Create an account'}</button>
+    </form>
+  </div>;
+}
+
+function Protected({ children }) {
+  const [state, setState] = useState('loading');
+  useEffect(() => {
+    if (localStorage.getItem('bmos:demo') === 'true') { setState('ready'); return; }
+    api.get('/auth/me').then(r => { setSession(r.data); setState('ready'); }).catch(() => setState('blocked'));
+  }, []);
+  if (state === 'loading') return <FullLoader/>;
+  return state === 'blocked' ? <Navigate to="/auth" replace/> : children;
+}
+
 function ExistingOrgLink({ org }) {
   const navigate = useNavigate();
   const last = localStorage.getItem(`bmos:last-brand:${org.id}`);
@@ -78,11 +135,13 @@ function ExistingOrgLink({ org }) {
   );
 }
 
-// ------------------------------------------------------------------ Onboarding (simplified to 3 steps)
+// ------------------------------------------------------------------ Onboarding (five persisted steps)
 const STEPS = [
-  { k: 'workspace', title: 'Workspace', hint: 'Name & brand' },
-  { k: 'rules',     title: 'Rules',     hint: 'What must never appear' },
-  { k: 'memory',    title: 'Memory',    hint: 'Add past emails' },
+  { k: 'organization', title: 'Organization', hint: 'Private boundary' },
+  { k: 'brand', title: 'Brand', hint: 'Identity & market' },
+  { k: 'research', title: 'Research', hint: 'Evidence first' },
+  { k: 'guardrails', title: 'Guardrails', hint: 'Human controlled' },
+  { k: 'memory', title: 'Memory', hint: 'Review & enter' },
 ];
 
 function Onboarding() {
@@ -91,7 +150,7 @@ function Onboarding() {
   const [orgId, setOrgId] = useState('');
   const [brandId, setBrandId] = useState('');
   const [form, setForm] = useState({
-    orgName: '', orgType: 'brand', brandName: '', brandUrl: '',
+    orgName: '', orgType: 'brand', brandName: '', brandUrl: '', industry: '', market: '',
   });
   const [rules, setRules] = useState({
     tone: ['warm', 'specific'],
@@ -99,34 +158,73 @@ function Onboarding() {
     approved_claims: [], colors: [], layout_rules: [], cta_style: '',
   });
   const [busy, setBusy] = useState(false);
+  const [research, setResearch] = useState(null);
+  const [researchNotes, setResearchNotes] = useState('');
 
-  const submitWorkspace = async () => {
-    if (!form.orgName.trim() || !form.brandName.trim()) {
-      toast.error('Give both a workspace and brand name'); return;
-    }
+  useEffect(() => {
+    const resumeId = new URLSearchParams(window.location.search).get('org');
+    if (!resumeId) return;
+    api.get(`/organizations/${resumeId}/onboarding`).then(r => {
+      const { organization:o, brand:b, guidelines:g, research:rr } = r.data;
+      setOrgId(o.id); setBrandId(b?.id || ''); setStep(Math.min(5, o.onboarding_step || 1));
+      setForm(f => ({...f, orgName:o.name, orgType:o.type, brandName:b?.name || '', brandUrl:b?.url || '', industry:b?.industry || '', market:b?.market || ''}));
+      if (g) setRules({tone:g.tone || [], prohibited_claims:g.prohibited_claims || [], approved_claims:g.approved_claims || [], colors:g.colors || [], layout_rules:g.layout_rules || [], cta_style:g.cta_style || ''});
+      if (rr) setResearch(rr);
+    }).catch(() => toast.error('Could not resume setup'));
+  }, []);
+
+  const submitOrganization = async () => {
+    if (!form.orgName.trim()) { toast.error('Give the organization a name'); return; }
     setBusy(true);
     try {
+      if (orgId) {
+        await api.patch(`/organizations/${orgId}/onboarding`, { step: 2, complete: false });
+        setStep(2); return;
+      }
       const o = await api.post('/organizations', {
         name: form.orgName, type: form.orgType, role: '', managed_brands: 1, industry: '',
       });
-      setOrgId(o.data.id);
-      const b = await api.post(`/organizations/${o.data.id}/brands`, {
-        name: form.brandName, url: form.brandUrl, industry: '', market: '',
-      });
-      setBrandId(b.data.id);
-      localStorage.setItem(`bmos:last-brand:${o.data.id}`, b.data.id);
       await api.patch(`/organizations/${o.data.id}/onboarding`, { step: 2, complete: false });
+      setOrgId(o.data.id);
       setStep(2);
     } catch (_e) { toast.error('Could not create workspace'); }
     finally { setBusy(false); }
+  };
+
+  const submitBrand = async () => {
+    if (!form.brandName.trim()) { toast.error('Give the brand a name'); return; }
+    setBusy(true);
+    try {
+      if (brandId) {
+        await api.patch(`/organizations/${orgId}/onboarding`, {step:3, complete:false});
+        setStep(3); return;
+      }
+      const b = await api.post(`/organizations/${orgId}/brands`, {name:form.brandName, url:form.brandUrl, industry:form.industry, market:form.market});
+      setBrandId(b.data.id); localStorage.setItem(`bmos:last-brand:${orgId}`, b.data.id);
+      await api.patch(`/organizations/${orgId}/onboarding`, {step:3, complete:false}); setStep(3);
+    } catch (e) { toast.error(e.response?.data?.detail || 'Could not save brand'); }
+    finally { setBusy(false); }
+  };
+
+  const runResearch = async () => {
+    setBusy(true);
+    try {
+      const r = await api.post(`/brands/${brandId}/research`, {url:form.brandUrl, notes:researchNotes});
+      setResearch(r.data); toast.success('Research ready for your review');
+    } catch (e) { toast.error(e.response?.data?.detail || 'Research could not run. You can continue manually.'); }
+    finally { setBusy(false); }
+  };
+
+  const continueResearch = async () => {
+    await api.patch(`/organizations/${orgId}/onboarding`, {step:4, complete:false}); setStep(4);
   };
 
   const submitRules = async () => {
     setBusy(true);
     try {
       await api.patch(`/brands/${brandId}/guidelines`, rules);
-      await api.patch(`/organizations/${orgId}/onboarding`, { step: 3, complete: false });
-      setStep(3);
+      await api.patch(`/organizations/${orgId}/onboarding`, { step: 5, complete: false });
+      setStep(5);
     } catch (_e) { toast.error('Could not save rules'); }
     finally { setBusy(false); }
   };
@@ -134,7 +232,7 @@ function Onboarding() {
   const finish = async () => {
     setBusy(true);
     try {
-      await api.patch(`/organizations/${orgId}/onboarding`, { step: 3, complete: true });
+      await api.patch(`/organizations/${orgId}/onboarding`, { step: 5, complete: true, data_choice: 'skip' });
       navigate(`/app/${orgId}/${brandId}/dashboard`);
     } finally { setBusy(false); }
   };
@@ -155,45 +253,57 @@ function Onboarding() {
       </header>
       <main className="onb-body">
         {step === 1 && (
-          <StepShell title="Name your workspace." sub="One workspace holds one brand's private memory. Agencies can add more brands later.">
+          <StepShell title="Create the organization boundary." sub="People and brands are isolated through organization membership. No workspace opens without an authenticated account.">
             <label>Workspace / organization<input data-testid="onb-org-name" value={form.orgName} onChange={e => setForm({ ...form, orgName: e.target.value })} placeholder="Alpine Studio" autoFocus /></label>
-            <div className="row">
-              <label>Type
+            <label>Type
                 <select data-testid="onb-org-type" value={form.orgType} onChange={e => setForm({ ...form, orgType: e.target.value })}>
                   <option value="brand">In-house brand</option>
                   <option value="agency">Agency</option>
                   <option value="in-house">In-house team</option>
                 </select>
-              </label>
-              <label>Brand name<input data-testid="onb-brand-name" value={form.brandName} onChange={e => setForm({ ...form, brandName: e.target.value })} placeholder="Alpine Kettle Co." /></label>
-            </div>
-            <label>Brand website <small>optional</small><input data-testid="onb-brand-url" value={form.brandUrl} onChange={e => setForm({ ...form, brandUrl: e.target.value })} placeholder="https://alpinekettle.com" /></label>
+            </label>
             <div className="onb-actions">
               <button className="ghost" onClick={() => navigate('/')} data-testid="onb-back-1"><ArrowLeft size={16} /> Back</button>
-              <button className="primary" data-testid="onb-continue-1" onClick={submitWorkspace} disabled={busy}>{busy ? 'Saving…' : 'Continue'} <ArrowRight size={16} /></button>
+              <button className="primary" data-testid="onb-continue-1" onClick={submitOrganization} disabled={busy}>{busy ? 'Saving…' : 'Continue'} <ArrowRight size={16} /></button>
             </div>
           </StepShell>
         )}
         {step === 2 && (
-          <StepShell title="What must the memory never say?" sub="These are the hard rules. If a recommendation hits one, export is blocked with a clear reason. Add tone words if you want — they help the AI stay on brand.">
+          <StepShell title="Add the first brand." sub="The website must be public. Private-network and localhost URLs are rejected before research begins.">
+            <label>Brand name<input value={form.brandName} onChange={e => setForm({...form,brandName:e.target.value})} placeholder="Alpine Kettle Co." autoFocus/></label>
+            <label>Public website<input type="url" value={form.brandUrl} onChange={e => setForm({...form,brandUrl:e.target.value})} placeholder="https://alpinekettle.com"/></label>
+            <div className="row"><label>Industry<input value={form.industry} onChange={e => setForm({...form,industry:e.target.value})} placeholder="Outdoor cookware"/></label><label>Market<input value={form.market} onChange={e => setForm({...form,market:e.target.value})} placeholder="US / UK"/></label></div>
+            <div className="onb-actions"><button className="ghost" onClick={()=>setStep(1)}><ArrowLeft size={16}/> Back</button><button className="primary" onClick={submitBrand} disabled={busy}>{busy?'Saving…':'Continue'} <ArrowRight size={16}/></button></div>
+          </StepShell>
+        )}
+        {step === 3 && (
+          <StepShell title="Research before generating." sub="A controlled OpenAI agent handoff extracts evidence, analyzes strategy, then proposes conservative controls. Nothing is applied automatically.">
+            <div className="research-callout"><Search size={20}/><div><b>Evidence → strategy → safety synthesis</b><p>Only the approved website is cited. Website text is treated as untrusted input.</p></div></div>
+            <label>Optional research context<textarea value={researchNotes} onChange={e=>setResearchNotes(e.target.value)} placeholder="Known audience, positioning, or compliance context…"/></label>
+            {research && <ResearchSummary research={research}/>}
+            <div className="onb-actions"><button className="ghost" onClick={()=>setStep(2)}><ArrowLeft size={16}/> Back</button><div className="split-actions"><button className="outline" onClick={runResearch} disabled={busy || !form.brandUrl}>{busy?'Researching…':research?'Run again':'Run brand research'}</button><button className="primary" onClick={continueResearch}>Continue <ArrowRight size={16}/></button></div></div>
+          </StepShell>
+        )}
+        {step === 4 && (
+          <StepShell title="Set the hard guardrails." sub="These checks run deterministically. AI research is advisory; you remain the final approver.">
             <ChipsField testid="onb-tone" label="Voice & tone" items={rules.tone} onChange={v => setRules({ ...rules, tone: v })} placeholder="warm, quietly confident…" />
             <ChipsField testid="onb-prohibited" label="Prohibited claims (the hard rules)" danger items={rules.prohibited_claims} onChange={v => setRules({ ...rules, prohibited_claims: v })} placeholder="detox, cures anxiety, free forever…" />
             <p className="micro-note"><ShieldCheck size={13} /> These check every recommendation and blueprint. Deterministic — not left to the AI.</p>
             <div className="onb-actions">
-              <button className="ghost" onClick={() => setStep(1)} data-testid="onb-back-2"><ArrowLeft size={16} /> Back</button>
+              <button className="ghost" onClick={() => setStep(3)} data-testid="onb-back-2"><ArrowLeft size={16} /> Back</button>
               <button className="primary" data-testid="onb-continue-2" onClick={submitRules} disabled={busy}>{busy ? 'Saving…' : 'Continue'} <ArrowRight size={16} /></button>
             </div>
           </StepShell>
         )}
-        {step === 3 && (
-          <StepShell title="Add some memory (or skip)." sub="You can also do this later. GPT-5.4 extracts structure; the embedder makes it searchable.">
+        {step === 5 && (
+          <StepShell title="Add memory, then enter." sub="Upload past email evidence now or start with an empty, honest workspace. You can add more later.">
             <div className="memory-add">
               <UploadBox brandId={brandId} inline onDone={() => toast.success('Uploaded — analysis running')} />
               <div className="or">or</div>
               <ConnectSourcesRow brandId={brandId} onDone={() => toast.success('Pasted — analysis running')} />
             </div>
             <div className="onb-actions">
-              <button className="ghost" onClick={() => setStep(2)} data-testid="onb-back-3"><ArrowLeft size={16} /> Back</button>
+              <button className="ghost" onClick={() => setStep(4)} data-testid="onb-back-3"><ArrowLeft size={16} /> Back</button>
               <button className="primary" data-testid="onb-finish" onClick={finish} disabled={busy}>{busy ? 'Opening…' : 'Open workspace'} <ArrowRight size={16} /></button>
             </div>
           </StepShell>
@@ -211,6 +321,19 @@ function StepShell({ title, sub, children }) {
       <div className="step-form">{children}</div>
     </div>
   );
+}
+
+function ResearchSummary({ research }) {
+  const report = research.report || {};
+  return <div className="research-result">
+    <div className="research-status"><ShieldCheck size={15}/><b>Awaiting your review</b><span>{research.model}</span></div>
+    <p>{report.summary}</p>
+    <div className="research-facts">
+      <div><small>VOICE CANDIDATES</small><b>{(report.voice_traits || []).join(' · ') || 'None proposed'}</b></div>
+      <div><small>EVIDENCE</small><b>{report.evidence?.length || 0} cited observations</b></div>
+    </div>
+    <small>Agent output is not active policy. Review it again in Rules before adding any proposal.</small>
+  </div>;
 }
 
 function ChipsField({ label, placeholder, items, onChange, danger, testid }) {
@@ -329,6 +452,13 @@ function PasteModal({ brandId, provider, onClose, onDone }) {
 function Shell({ children, active, brand, org, isDemo }) {
   const { orgId, brandId } = useParams();
   const navigate = useNavigate();
+  const leave = async () => {
+    if (!isDemo) {
+      try { await api.post('/auth/logout'); } catch (_e) { /* ignore */ }
+      localStorage.removeItem('bmos:csrf');
+    }
+    localStorage.removeItem('bmos:demo'); navigate('/');
+  };
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -344,12 +474,12 @@ function Shell({ children, active, brand, org, isDemo }) {
         <nav>
           <button className={active === 'dashboard' ? 'active' : ''} data-testid="nav-dashboard" onClick={() => navigate(`/app/${orgId}/${brandId}/dashboard`)}><Sparkles size={16} /> Dashboard</button>
           <button className={active === 'campaigns' ? 'active' : ''} data-testid="nav-campaigns" onClick={() => navigate(`/app/${orgId}/${brandId}/campaigns`)}><BookOpen size={16} /> Memory</button>
-          <button className={active === 'brief' ? 'active' : ''} data-testid="nav-brief" onClick={() => navigate(`/app/${orgId}/${brandId}/briefs/new`)}><ClipboardList size={16} /> New brief</button>
-          <button className={active === 'guidelines' ? 'active' : ''} data-testid="nav-guidelines" onClick={() => navigate(`/app/${orgId}/${brandId}/guidelines`)}><ShieldCheck size={16} /> Rules</button>
+          {!isDemo && <button className={active === 'brief' ? 'active' : ''} data-testid="nav-brief" onClick={() => navigate(`/app/${orgId}/${brandId}/briefs/new`)}><ClipboardList size={16} /> New brief</button>}
+          {!isDemo && <button className={active === 'guidelines' ? 'active' : ''} data-testid="nav-guidelines" onClick={() => navigate(`/app/${orgId}/${brandId}/guidelines`)}><ShieldCheck size={16} /> Rules</button>}
         </nav>
         <div className="sidebar-foot">
           <div className="privacy"><LockKeyhole size={13} /><span>Private<br /><b>Only this brand</b></span></div>
-          <button className="link exit" data-testid="exit-workspace" onClick={() => navigate('/')}>Exit workspace</button>
+          <button className="link exit" data-testid="exit-workspace" onClick={leave}><LogOut size={13}/> {isDemo ? 'Exit demo' : 'Sign out'}</button>
         </div>
       </aside>
       <main className="main">{children}</main>
@@ -379,10 +509,10 @@ function Dashboard() {
         <ReadinessCard icon={<ShieldCheck size={16} />} label="Brand rules" value={ready.guidelines_set ? 'Set' : 'Not yet'} testid="ready-guidelines" />
         <ReadinessCard icon={<Gauge size={16} />} label="Outcomes recorded" value={ready.outcomes_attached} testid="ready-outcomes" />
       </section>
-      <div className="dash-actions">
+      {!isDemo ? <div className="dash-actions">
         <Link className="primary" data-testid="dash-cta-brief" to={`/app/${orgId}/${brandId}/briefs/new`}><Zap size={14} /> Create a brief</Link>
         <Link className="ghost light" data-testid="dash-cta-upload" to={`/app/${orgId}/${brandId}/campaigns`}><Plus size={14} /> Add campaigns</Link>
-      </div>
+      </div> : <div className="demo-notice"><LockKeyhole size={15}/><span>This sample is read-only. Create an account to build private brand memory.</span></div>}
       <section className="section">
         <h2>Recent memory</h2>
         <div className="library-grid">
@@ -436,13 +566,13 @@ function Campaigns() {
     <Shell active="campaigns" brand={d.brand} org={d.brand} isDemo={isDemo}>
       <Header eyebrow="MEMORY" title="Past work, kept in context." isDemo={isDemo} />
       <p className="page-sub">Every email keeps its objective, audience, and outcome attached. That&apos;s what makes recommendations trustworthy.</p>
-      <div className="add-sources">
+      {!isDemo && <div className="add-sources">
         <UploadBox brandId={brandId} onDone={reload} />
         <ConnectSourcesRow brandId={brandId} onDone={reload} />
-      </div>
+      </div>}
       <section className="library-grid">
         {list.length === 0 && <EmptyPanel title="No campaigns yet" body="Upload an email or paste one from your tool — the AI extracts structure and the memory becomes searchable." />}
-        {list.map(c => <CampaignCard key={c.id} c={c} withOutcome onOutcome={reload} />)}
+        {list.map(c => <CampaignCard key={c.id} c={c} withOutcome={!isDemo} onOutcome={reload} />)}
       </section>
     </Shell>
   );
@@ -550,7 +680,7 @@ function BriefNew() {
           <ol>
             <li>Your brief is turned into a search vector.</li>
             <li>It finds the closest past emails from this brand only.</li>
-            <li>GPT-5.4 writes a grounded rationale, citing them by name.</li>
+            <li>OpenAI writes a grounded rationale, citing them by name.</li>
             <li>Hard rules run last. If any hit, export is blocked.</li>
           </ol>
           <div className="rules-preview">
@@ -680,8 +810,10 @@ function GuidelinesPage() {
   const { brandId } = useParams();
   const [d, setD] = useState(null);
   const [g, setG] = useState(null);
+  const [research, setResearch] = useState(null);
   useEffect(() => {
     api.get(`/brands/${brandId}`).then(r => { setD(r.data); setG(r.data.guidelines || {}); });
+    api.get(`/brands/${brandId}/research/latest`).then(r => setResearch(r.data)).catch(() => {});
   }, [brandId]);
   const save = async () => {
     try {
@@ -693,12 +825,20 @@ function GuidelinesPage() {
       toast.success('New rules version saved');
     } catch (_e) { toast.error('Could not save'); }
   };
+  const approveResearch = async () => {
+    if (!window.confirm('Apply these reviewed research candidates as a new rules version?')) return;
+    try {
+      const r = await api.post(`/brands/${brandId}/research/${research.id}/apply`, {approved:true});
+      setG(r.data); setResearch({...research,status:'approved'}); toast.success('Research approved as a new rules version');
+    } catch (e) { toast.error(e.response?.data?.detail || 'Research could not be applied'); }
+  };
   if (!d || !g) return <FullLoader />;
   const isDemo = d.brand.name?.includes('Northstar');
   return (
     <Shell active="guidelines" brand={d.brand} org={d.organization} isDemo={isDemo}>
       <Header eyebrow="RULES" title="The guardrails behind every recommendation." isDemo={isDemo} />
       <p className="page-sub">Prohibited claims are hard rules — they block export. Everything else is guidance.</p>
+      {research?.status === 'awaiting_review' && <div className="research-review"><ResearchSummary research={research}/><div><b>Human approval required</b><p>Review the cited report before merging its voice, claim, and layout candidates into a new immutable rules version.</p><button className="outline" onClick={approveResearch}>Approve reviewed candidates</button></div></div>}
       <div className="memory-grid">
         <ChipsField label="Voice & tone" testid="g-tone" items={g.tone || []} onChange={v => setG({ ...g, tone: v })} placeholder="warm, quietly confident…" />
         <ChipsField label="Approved claims" testid="g-approved" items={g.approved_claims || []} onChange={v => setG({ ...g, approved_claims: v })} placeholder="small-batch roasted…" />
@@ -714,7 +854,7 @@ function GuidelinesPage() {
 // ------------------------------------------------------------------ Misc
 function DemoRedirect() {
   const [target, setTarget] = useState(null);
-  useEffect(() => { api.get('/demo').then(r => setTarget(r.data)).catch(() => setTarget(false)); }, []);
+  useEffect(() => { api.get('/demo').then(r => { localStorage.setItem('bmos:demo', 'true'); setTarget(r.data); }).catch(() => setTarget(false)); }, []);
   if (target === null) return <FullLoader />;
   if (target === false) return <div className="landing"><div className="landing-copy"><h1>Demo unavailable</h1><Link to="/">Back</Link></div></div>;
   return <Navigate to={`/app/${target.org_id}/${target.brand_id}/dashboard`} replace />;
@@ -768,13 +908,14 @@ export default function App() {
       <Toaster position="top-right" richColors />
       <Routes>
         <Route path="/" element={<Landing />} />
-        <Route path="/onboarding" element={<Onboarding />} />
+        <Route path="/auth" element={<AuthPage />} />
+        <Route path="/onboarding" element={<Protected><Onboarding /></Protected>} />
         <Route path="/demo" element={<DemoRedirect />} />
-        <Route path="/app/:orgId/:brandId/dashboard" element={<Dashboard />} />
-        <Route path="/app/:orgId/:brandId/campaigns" element={<Campaigns />} />
-        <Route path="/app/:orgId/:brandId/briefs/new" element={<BriefNew />} />
-        <Route path="/app/:orgId/:brandId/recommendations/:recId" element={<Recommendation />} />
-        <Route path="/app/:orgId/:brandId/guidelines" element={<GuidelinesPage />} />
+        <Route path="/app/:orgId/:brandId/dashboard" element={<Protected><Dashboard /></Protected>} />
+        <Route path="/app/:orgId/:brandId/campaigns" element={<Protected><Campaigns /></Protected>} />
+        <Route path="/app/:orgId/:brandId/briefs/new" element={<Protected><BriefNew /></Protected>} />
+        <Route path="/app/:orgId/:brandId/recommendations/:recId" element={<Protected><Recommendation /></Protected>} />
+        <Route path="/app/:orgId/:brandId/guidelines" element={<Protected><GuidelinesPage /></Protected>} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </BrowserRouter>
