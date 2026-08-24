@@ -265,6 +265,11 @@ class OutcomeIn(BaseModel):
     notes: str = ''
 
 
+class ConnectIn(BaseModel):
+    provider: Literal['klaviyo', 'mailchimp']
+    api_key: str = Field(min_length=8, max_length=400)
+
+
 # --------------- helpers
 def now(): return datetime.now(timezone.utc).isoformat()
 
@@ -730,6 +735,208 @@ async def paste_campaign(brand_id: str, body: PasteIn, request: Request, backgro
     })
     background.add_task(process_pasted, campaign_id, body.html, body.name)
     return {'campaign_id': campaign_id, 'status': 'processing', 'source': body.source}
+
+
+# --------------- provider connections (Klaviyo / Mailchimp)
+def _fernet():
+    """Derive a Fernet key from SESSION_SECRET for at-rest encryption of API keys."""
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    import base64
+    secret = os.environ.get('SESSION_SECRET', 'brand-memory-dev-secret-2026').encode()
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=b'bmos-conn', iterations=200000)
+    return Fernet(base64.urlsafe_b64encode(kdf.derive(secret)))
+
+
+def encrypt_secret(value: str) -> str:
+    return _fernet().encrypt(value.encode()).decode()
+
+
+def decrypt_secret(value: str) -> str:
+    return _fernet().decrypt(value.encode()).decode()
+
+
+def klaviyo_headers(key: str) -> dict:
+    return {
+        'Authorization': f'Klaviyo-API-Key {key}',
+        'accept': 'application/vnd.api+json',
+        'revision': '2024-10-15',
+    }
+
+
+def mailchimp_server(key: str) -> str:
+    # Mailchimp keys look like "abcdef-us14" — the dc after the dash is the server prefix.
+    if '-' not in key:
+        raise HTTPException(422, 'Mailchimp key must include the datacenter suffix, e.g. -us14')
+    return key.rsplit('-', 1)[-1].strip()
+
+
+def validate_provider_key(provider: str, key: str) -> dict:
+    """Ping the provider to confirm the key works; returns a short account summary."""
+    try:
+        if provider == 'klaviyo':
+            r = requests.get('https://a.klaviyo.com/api/accounts', headers=klaviyo_headers(key), timeout=10)
+            if r.status_code == 401 or r.status_code == 403:
+                raise HTTPException(422, 'Klaviyo rejected this API key')
+            r.raise_for_status()
+            data = r.json().get('data', [])
+            account = (data[0].get('attributes') or {}) if data else {}
+            return {'account': account.get('contact_information', {}).get('organization_name') or 'Klaviyo account'}
+        if provider == 'mailchimp':
+            dc = mailchimp_server(key)
+            r = requests.get(f'https://{dc}.api.mailchimp.com/3.0/ping',
+                             auth=('anystring', key), timeout=10)
+            if r.status_code == 401:
+                raise HTTPException(422, 'Mailchimp rejected this API key')
+            r.raise_for_status()
+            return {'account': 'Mailchimp account', 'dc': dc}
+    except HTTPException:
+        raise
+    except requests.RequestException as e:
+        raise HTTPException(502, f'Could not reach {provider}: {str(e)[:120]}')
+    raise HTTPException(400, 'unsupported provider')
+
+
+@api.post('/brands/{brand_id}/connections', status_code=201)
+async def create_connection(brand_id: str, body: ConnectIn, request: Request):
+    user = await require_user(db, request, csrf=True)
+    b = await load_brand(brand_id, user['id'], write=True)
+    await limiter.check(f'connect:{user["id"]}', limit=20, window_seconds=3600)
+    summary = validate_provider_key(body.provider, body.api_key)
+    doc = {
+        'id': uuid.uuid4().hex, 'org_id': b['org_id'], 'brand_id': brand_id,
+        'provider': body.provider, 'api_key_enc': encrypt_secret(body.api_key),
+        'account_label': summary.get('account'), 'meta': {k: v for k, v in summary.items() if k != 'account'},
+        'connected_by': user['id'], 'created_at': now(),
+    }
+    await db.connections.replace_one(
+        {'brand_id': brand_id, 'provider': body.provider}, doc, upsert=True,
+    )
+    return {'provider': body.provider, 'account': summary.get('account'), 'connected_at': doc['created_at']}
+
+
+@api.get('/brands/{brand_id}/connections')
+async def list_connections(brand_id: str, request: Request):
+    user = await require_viewer(request)
+    await load_brand(brand_id, user['id'])
+    conns = [c async for c in db.connections.find(
+        {'brand_id': brand_id}, {'_id': 0, 'api_key_enc': 0}
+    )]
+    return conns
+
+
+@api.delete('/brands/{brand_id}/connections/{provider}')
+async def disconnect(brand_id: str, provider: str, request: Request):
+    user = await require_user(db, request, csrf=True)
+    await load_brand(brand_id, user['id'], write=True)
+    r = await db.connections.delete_one({'brand_id': brand_id, 'provider': provider})
+    if not r.deleted_count:
+        raise HTTPException(404, 'connection not found')
+    return {'deleted': True}
+
+
+async def _sync_klaviyo(brand_id: str, org_id: str, key: str, background: BackgroundTasks) -> list[str]:
+    """List recent Klaviyo email campaigns and enqueue each for extraction."""
+    url = ('https://a.klaviyo.com/api/campaigns'
+           '?filter=equals(messages.channel,%22email%22)'
+           '&sort=-created_at&page[size]=5')
+    r = requests.get(url, headers=klaviyo_headers(key), timeout=15)
+    r.raise_for_status()
+    ids = []
+    for camp in r.json().get('data', [])[:5]:
+        attrs = camp.get('attributes', {}) or {}
+        cname = attrs.get('name') or f"Klaviyo {camp.get('id','')[:8]}"
+        # fetch message html (campaigns endpoint doesn't include HTML directly)
+        html = attrs.get('subject_line') or ''
+        try:
+            msgs = requests.get(
+                f'https://a.klaviyo.com/api/campaign-messages'
+                f'?filter=equals(campaign_id,%22{camp["id"]}%22)',
+                headers=klaviyo_headers(key), timeout=15)
+            if msgs.ok:
+                for m in msgs.json().get('data', [])[:1]:
+                    render = (m.get('attributes') or {}).get('render_options') or {}
+                    tmpl = (m.get('attributes') or {}).get('definition') or {}
+                    html = (tmpl.get('content') or {}).get('body') or html
+        except Exception:
+            pass
+        campaign_id = uuid.uuid4().hex
+        await db.campaigns.insert_one({
+            'id': campaign_id, 'org_id': org_id, 'brand_id': brand_id,
+            'name': cname, 'source_type': 'klaviyo', 'file_path': None,
+            'pasted_html': (html or attrs.get('subject_line') or cname)[:200000],
+            'external_id': camp.get('id'),
+            'status': 'processing', 'metrics': {}, 'created_at': now(),
+        })
+        background.add_task(process_pasted, campaign_id,
+                            html or attrs.get('subject_line') or cname, cname)
+        ids.append(campaign_id)
+    return ids
+
+
+async def _sync_mailchimp(brand_id: str, org_id: str, key: str, background: BackgroundTasks) -> list[str]:
+    dc = mailchimp_server(key)
+    r = requests.get(
+        f'https://{dc}.api.mailchimp.com/3.0/campaigns'
+        '?count=5&status=sent&type=regular&sort_field=send_time&sort_dir=DESC',
+        auth=('anystring', key), timeout=15)
+    r.raise_for_status()
+    ids = []
+    for camp in r.json().get('campaigns', [])[:5]:
+        cname = (camp.get('settings') or {}).get('title') or camp.get('id')
+        html = ''
+        try:
+            content = requests.get(
+                f'https://{dc}.api.mailchimp.com/3.0/campaigns/{camp["id"]}/content',
+                auth=('anystring', key), timeout=15)
+            if content.ok:
+                html = content.json().get('html') or ''
+        except Exception:
+            pass
+        campaign_id = uuid.uuid4().hex
+        await db.campaigns.insert_one({
+            'id': campaign_id, 'org_id': org_id, 'brand_id': brand_id,
+            'name': cname, 'source_type': 'mailchimp', 'file_path': None,
+            'pasted_html': (html or (camp.get('settings') or {}).get('subject_line') or cname)[:200000],
+            'external_id': camp.get('id'),
+            'status': 'processing', 'metrics': {}, 'created_at': now(),
+        })
+        background.add_task(process_pasted, campaign_id,
+                            html or (camp.get('settings') or {}).get('subject_line') or cname, cname)
+        ids.append(campaign_id)
+    return ids
+
+
+@api.post('/brands/{brand_id}/connections/{provider}/sync')
+async def sync_provider(brand_id: str, provider: str, request: Request, background: BackgroundTasks):
+    user = await require_user(db, request, csrf=True)
+    b = await load_brand(brand_id, user['id'], write=True)
+    await limiter.check(f'sync:{brand_id}:{provider}', limit=6, window_seconds=600)
+    conn = await db.connections.find_one({'brand_id': brand_id, 'provider': provider})
+    if not conn:
+        raise HTTPException(404, 'not connected')
+    try:
+        key = decrypt_secret(conn['api_key_enc'])
+    except Exception:
+        raise HTTPException(500, 'stored key could not be decrypted; reconnect')
+    try:
+        if provider == 'klaviyo':
+            ids = await _sync_klaviyo(brand_id, b['org_id'], key, background)
+        elif provider == 'mailchimp':
+            ids = await _sync_mailchimp(brand_id, b['org_id'], key, background)
+        else:
+            raise HTTPException(400, 'unsupported provider')
+    except requests.HTTPError as e:
+        status = e.response.status_code if getattr(e, 'response', None) is not None else 502
+        raise HTTPException(502, f'{provider} sync failed ({status})')
+    except requests.RequestException as e:
+        raise HTTPException(502, f'{provider} sync failed: {str(e)[:120]}')
+    await db.connections.update_one(
+        {'brand_id': brand_id, 'provider': provider},
+        {'$set': {'last_synced_at': now(), 'last_sync_count': len(ids)}}
+    )
+    return {'provider': provider, 'imported': len(ids), 'campaign_ids': ids}
 
 
 @api.get('/brands/{brand_id}/campaigns')
