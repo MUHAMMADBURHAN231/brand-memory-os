@@ -26,8 +26,10 @@ numpy>=1.26.0
 python-multipart>=0.0.9
 jq>=1.6.0
 typer>=0.9.0
+openai>=1.40.0
 sentence-transformers==6.0.0
 beautifulsoup4==4.15.0
 pypdf==6.16.1
 openai-agents>=0.2.9,<1
 redis>=5.0.0,<7
+mongomock-motor>=0.0.34

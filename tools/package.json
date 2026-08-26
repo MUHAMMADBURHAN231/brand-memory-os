@@ -1,0 +1,8 @@
+{
+  "name": "bmos-dev-tools",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "mongodb-memory-server": "^10.1.4"
+  }
+}
