@@ -82,7 +82,13 @@ memory/test_credentials.md
 android-sdk/
 .env
 .env.*
+!.env.example
+!backend/.env.example
+!frontend/.env.example
 *.env
 credentials.json
 *.key
 .credentials
+
+# Test caches
+.pytest_cache/

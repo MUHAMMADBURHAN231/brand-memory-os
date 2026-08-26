@@ -4,7 +4,7 @@ import axios from 'axios';
 import {
   ArrowRight, ArrowLeft, Check, ChevronRight, Download, Gauge, Lightbulb, LockKeyhole,
   Sparkles, ShieldCheck, BookOpen, Upload, FileText, Loader2, X, Plus, AlertTriangle,
-  ExternalLink, ClipboardList, Zap, Link2, LogOut, Search, UserRound,
+  ExternalLink, ClipboardList, Zap, Link2, LogOut, Search, UserRound, KeyRound, RefreshCw,
 } from 'lucide-react';
 import { toast, Toaster } from 'sonner';
 import './App.css';
@@ -25,13 +25,17 @@ function setSession(data) {
   localStorage.removeItem('bmos:demo');
 }
 
-// Providers users can "connect" — paste-based today, OAuth on roadmap
+function isDemoWorkspace(d) {
+  return Boolean(d?.is_demo || d?.organization?.is_demo);
+}
+
+// Providers: Klaviyo/Mailchimp support encrypted API-key sync; others remain paste-based.
 const PROVIDERS = [
-  { id: 'klaviyo',   name: 'Klaviyo',   hint: 'Paste an email preview HTML' },
-  { id: 'mailchimp', name: 'Mailchimp', hint: 'Paste from campaign preview' },
-  { id: 'figma',     name: 'Figma',     hint: 'Right-click frame → Copy as HTML' },
-  { id: 'hubspot',   name: 'HubSpot',   hint: 'Paste from email preview' },
-  { id: 'iterable',  name: 'Iterable',  hint: 'Paste HTML export' },
+  { id: 'klaviyo',   name: 'Klaviyo',   hint: 'Sync campaigns or paste HTML', native: true },
+  { id: 'mailchimp', name: 'Mailchimp', hint: 'Sync campaigns or paste HTML', native: true },
+  { id: 'figma',     name: 'Figma',     hint: 'Right-click frame → Copy as HTML', native: false },
+  { id: 'hubspot',   name: 'HubSpot',   hint: 'Paste from email preview', native: false },
+  { id: 'iterable',  name: 'Iterable',  hint: 'Paste HTML export', native: false },
 ];
 
 // ------------------------------------------------------------------ Landing
@@ -57,7 +61,7 @@ function Landing() {
           <div><b>Brand Memory</b><small>OS</small></div>
         </div>
         <h1>Every send<br/>inherits your best work.</h1>
-        <p>Feed it your past emails. Every future brief pulls back grounded direction, cited to real campaigns, checked against your rules.</p>
+        <p>Agency lifecycle marketers paste or sync past emails. Every future brief comes back cited to real campaigns and blocked when a hard brand rule is hit.</p>
         <div className="landing-actions">
           <button className="primary large" data-testid="cta-create-workspace" onClick={() => navigate(user ? '/onboarding' : '/auth?mode=register')}>
             {user ? 'Create workspace' : 'Create account'} <ArrowRight size={18} />
@@ -95,7 +99,10 @@ function AuthPage() {
     try {
       const r = await api.post(`/auth/${mode}`, form);
       setSession(r.data); navigate(r.data.organizations?.length ? '/' : '/onboarding');
-    } catch (err) { toast.error(err.response?.data?.detail || 'Could not sign in'); }
+    } catch (err) {
+      const detail = err.response?.data?.detail;
+      toast.error(typeof detail === 'string' ? detail : (err.request && !err.response ? 'Backend is not running on http://localhost:8000' : 'Could not sign in'));
+    }
     finally { setBusy(false); }
   };
   return <div className="auth-page">
@@ -336,7 +343,7 @@ function ResearchSummary({ research }) {
   </div>;
 }
 
-function ChipsField({ label, placeholder, items, onChange, danger, testid }) {
+function ChipsField({ label, placeholder, items, onChange, danger, testid, readOnly }) {
   const [v, setV] = useState('');
   const add = () => { if (v.trim()) { onChange([...items, v.trim()]); setV(''); } };
   return (
@@ -344,13 +351,13 @@ function ChipsField({ label, placeholder, items, onChange, danger, testid }) {
       <label>{label}</label>
       <div className={`chips ${danger ? 'danger' : ''}`}>
         {items.map((x, i) => (
-          <span key={i} data-testid={`${testid}-chip-${i}`}>{x}<button onClick={() => onChange(items.filter((_, j) => j !== i))}><X size={12} /></button></span>
+          <span key={i} data-testid={`${testid}-chip-${i}`}>{x}{!readOnly && <button onClick={() => onChange(items.filter((_, j) => j !== i))}><X size={12} /></button>}</span>
         ))}
       </div>
-      <div className="chip-input">
+      {!readOnly && <div className="chip-input">
         <input data-testid={`${testid}-input`} value={v} onChange={e => setV(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); add(); } }} placeholder={placeholder} />
         <button className="ghost tiny" data-testid={`${testid}-add`} onClick={add}><Plus size={13} /> Add</button>
-      </div>
+      </div>}
     </div>
   );
 }
@@ -393,39 +400,90 @@ function UploadBox({ brandId, onDone, inline }) {
 // ------------------------------------------------------------------ Connect sources
 function ConnectSourcesRow({ brandId, onDone }) {
   const [openId, setOpenId] = useState(null);
+  const [connections, setConnections] = useState([]);
+  const load = useCallback(() => {
+    api.get(`/brands/${brandId}/connections`).then(r => setConnections(r.data || [])).catch(() => setConnections([]));
+  }, [brandId]);
+  useEffect(() => { load(); }, [load]);
   const opened = PROVIDERS.find(p => p.id === openId);
+  const connected = (id) => connections.find(c => c.provider === id);
   return (
     <div className="connect-row">
       <div className="upload-head">
         <Link2 size={16} />
-        <div><b>Connect from your tools</b><small>Paste HTML from any email or design tool</small></div>
+        <div><b>Connect from your tools</b><small>Klaviyo and Mailchimp can sync. Everyone else pastes HTML.</small></div>
       </div>
       <div className="provider-tiles">
         {PROVIDERS.map(p => (
-          <button key={p.id} className="provider-tile" data-testid={`provider-${p.id}`} onClick={() => setOpenId(p.id)}>
+          <button key={p.id} className={`provider-tile ${connected(p.id) ? 'connected' : ''}`} data-testid={`provider-${p.id}`} onClick={() => setOpenId(p.id)}>
             <span className="tile-logo">{p.name[0]}</span>
             <b>{p.name}</b>
-            <small>{p.hint}</small>
+            <small>{connected(p.id) ? `Connected · ${connected(p.id).account_label || p.name}` : p.hint}</small>
           </button>
         ))}
       </div>
-      {opened && <PasteModal brandId={brandId} provider={opened} onClose={() => setOpenId(null)} onDone={() => { setOpenId(null); onDone(); }} />}
+      {opened && (
+        <ProviderModal
+          brandId={brandId}
+          provider={opened}
+          connection={connected(opened.id)}
+          onClose={() => setOpenId(null)}
+          onRefresh={load}
+          onDone={() => { setOpenId(null); load(); onDone(); }}
+        />
+      )}
     </div>
   );
 }
 
-function PasteModal({ brandId, provider, onClose, onDone }) {
+function ProviderModal({ brandId, provider, connection, onClose, onDone, onRefresh }) {
+  const native = provider.native;
+  const [tab, setTab] = useState(native ? (connection ? 'sync' : 'key') : 'paste');
   const [name, setName] = useState('');
   const [html, setHtml] = useState('');
+  const [apiKey, setApiKey] = useState('');
   const [busy, setBusy] = useState(false);
-  const submit = async () => {
+  const paste = async () => {
     if (!name.trim() || !html.trim()) { toast.error('Name it and paste some HTML'); return; }
     setBusy(true);
     try {
       await api.post(`/brands/${brandId}/campaigns/paste`, { name, source: provider.id, html });
+      toast.success('Added to memory — analysis running');
       onDone();
     } catch (e) {
       toast.error(e.response?.data?.detail || 'Could not add');
+    } finally { setBusy(false); }
+  };
+  const connect = async () => {
+    if (apiKey.trim().length < 8) { toast.error('Paste a private API key'); return; }
+    setBusy(true);
+    try {
+      const r = await api.post(`/brands/${brandId}/connections`, { provider: provider.id, api_key: apiKey.trim() });
+      toast.success(`Connected ${r.data.account || provider.name}`);
+      setTab('sync'); setApiKey('');
+      onRefresh?.();
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Could not connect');
+    } finally { setBusy(false); }
+  };
+  const sync = async () => {
+    setBusy(true);
+    try {
+      const r = await api.post(`/brands/${brandId}/connections/${provider.id}/sync`);
+      toast.success(`Imported ${r.data.imported} campaign${r.data.imported === 1 ? '' : 's'}`);
+      onDone();
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Sync failed');
+    } finally { setBusy(false); }
+  };
+  const disconnect = async () => {
+    setBusy(true);
+    try {
+      await api.delete(`/brands/${brandId}/connections/${provider.id}`);
+      toast.success('Disconnected');
+      onDone();
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Could not disconnect');
     } finally { setBusy(false); }
   };
   return (
@@ -435,21 +493,49 @@ function PasteModal({ brandId, provider, onClose, onDone }) {
           <div><b>Connect from {provider.name}</b><small>{provider.hint}</small></div>
           <button onClick={onClose} data-testid="paste-close"><X size={16} /></button>
         </div>
-        <label>Campaign name<input data-testid="paste-name" value={name} onChange={e => setName(e.target.value)} placeholder={`${provider.name} — winter launch`} autoFocus /></label>
-        <label>Paste email HTML
-          <textarea data-testid="paste-html" value={html} onChange={e => setHtml(e.target.value)} rows={8} placeholder="<html>…paste from your tool…</html>" />
-        </label>
-        <div className="modal-foot">
-          <small className="soon">OAuth sync from {provider.name} · on the roadmap</small>
-          <button className="primary" data-testid="paste-submit" onClick={submit} disabled={busy}>{busy ? 'Adding…' : 'Add to memory'} <ArrowRight size={13} /></button>
-        </div>
+        {native && (
+          <div className="modal-tabs">
+            <button className={tab !== 'paste' ? 'active' : ''} onClick={() => setTab(connection ? 'sync' : 'key')} data-testid="tab-sync">{connection ? 'API sync' : 'API key'}</button>
+            <button className={tab === 'paste' ? 'active' : ''} onClick={() => setTab('paste')} data-testid="tab-paste">Paste HTML</button>
+          </div>
+        )}
+        {tab === 'paste' && <>
+          <label>Campaign name<input data-testid="paste-name" value={name} onChange={e => setName(e.target.value)} placeholder={`${provider.name} — winter launch`} autoFocus /></label>
+          <label>Paste email HTML
+            <textarea data-testid="paste-html" value={html} onChange={e => setHtml(e.target.value)} rows={8} placeholder="<html>…paste from your tool…</html>" />
+          </label>
+          <div className="modal-foot">
+            <small className="soon">{native ? 'Private key is stored encrypted' : 'OAuth sync · on the roadmap'}</small>
+            <button className="primary" data-testid="paste-submit" onClick={paste} disabled={busy}>{busy ? 'Adding…' : 'Add to memory'} <ArrowRight size={13} /></button>
+          </div>
+        </>}
+        {native && tab !== 'paste' && !connection && <>
+          <p className="modal-help">Private keys never appear in the browser after save. They are encrypted at rest and used only to import recent email campaigns.</p>
+          <label>{provider.name} API key
+            <input data-testid="connect-key" type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder={provider.id === 'mailchimp' ? 'xxxx-us14' : 'pk_live_…'} autoFocus />
+          </label>
+          <div className="modal-foot">
+            <small className="soon"><KeyRound size={11} /> Encrypted · this brand only</small>
+            <button className="primary" data-testid="connect-submit" onClick={connect} disabled={busy}>{busy ? 'Checking…' : 'Connect'} <ArrowRight size={13} /></button>
+          </div>
+        </>}
+        {native && tab !== 'paste' && connection && <>
+          <div className="connected-box">
+            <b>{connection.account_label || provider.name}</b>
+            <small>Last sync {connection.last_synced_at ? new Date(connection.last_synced_at).toLocaleString() : 'never'} · {connection.last_sync_count || 0} imported</small>
+          </div>
+          <div className="modal-foot">
+            <button className="link" data-testid="disconnect-provider" onClick={disconnect} disabled={busy}>Disconnect</button>
+            <button className="primary" data-testid="sync-provider" onClick={sync} disabled={busy}>{busy ? 'Syncing…' : 'Sync last 5 emails'} <RefreshCw size={13} /></button>
+          </div>
+        </>}
       </div>
     </div>
   );
 }
 
 // ------------------------------------------------------------------ Workspace shell
-function Shell({ children, active, brand, org, isDemo }) {
+function Shell({ children, active, brand, org, isDemo, sampleRecId }) {
   const { orgId, brandId } = useParams();
   const navigate = useNavigate();
   const leave = async () => {
@@ -475,7 +561,8 @@ function Shell({ children, active, brand, org, isDemo }) {
           <button className={active === 'dashboard' ? 'active' : ''} data-testid="nav-dashboard" onClick={() => navigate(`/app/${orgId}/${brandId}/dashboard`)}><Sparkles size={16} /> Dashboard</button>
           <button className={active === 'campaigns' ? 'active' : ''} data-testid="nav-campaigns" onClick={() => navigate(`/app/${orgId}/${brandId}/campaigns`)}><BookOpen size={16} /> Memory</button>
           {!isDemo && <button className={active === 'brief' ? 'active' : ''} data-testid="nav-brief" onClick={() => navigate(`/app/${orgId}/${brandId}/briefs/new`)}><ClipboardList size={16} /> New brief</button>}
-          {!isDemo && <button className={active === 'guidelines' ? 'active' : ''} data-testid="nav-guidelines" onClick={() => navigate(`/app/${orgId}/${brandId}/guidelines`)}><ShieldCheck size={16} /> Rules</button>}
+          {isDemo && sampleRecId && <button className={active === 'brief' ? 'active' : ''} data-testid="nav-sample-brief" onClick={() => navigate(`/app/${orgId}/${brandId}/recommendations/${sampleRecId}`)}><ClipboardList size={16} /> Sample brief</button>}
+          <button className={active === 'guidelines' ? 'active' : ''} data-testid="nav-guidelines" onClick={() => navigate(`/app/${orgId}/${brandId}/guidelines`)}><ShieldCheck size={16} /> Rules</button>
         </nav>
         <div className="sidebar-foot">
           <div className="privacy"><LockKeyhole size={13} /><span>Private<br /><b>Only this brand</b></span></div>
@@ -497,10 +584,12 @@ function Dashboard() {
   }, [brandId]);
   if (err === 403) return <Blocked />;
   if (!d) return <FullLoader />;
-  const isDemo = d.brand.name?.includes('Northstar');
+  const isDemo = isDemoWorkspace(d);
   const ready = d.readiness;
+  const org = d.organization || d.brand;
+  const sampleRecId = d.latest_recommendation?.id;
   return (
-    <Shell active="dashboard" brand={d.brand} org={d.brand} isDemo={isDemo}>
+    <Shell active="dashboard" brand={d.brand} org={org} isDemo={isDemo} sampleRecId={sampleRecId}>
       <Header eyebrow="DASHBOARD" title={d.brand.name} isDemo={isDemo} />
       <p className="page-sub">Everything the memory currently knows about {d.brand.name}.</p>
       <section className="readiness">
@@ -512,7 +601,7 @@ function Dashboard() {
       {!isDemo ? <div className="dash-actions">
         <Link className="primary" data-testid="dash-cta-brief" to={`/app/${orgId}/${brandId}/briefs/new`}><Zap size={14} /> Create a brief</Link>
         <Link className="ghost light" data-testid="dash-cta-upload" to={`/app/${orgId}/${brandId}/campaigns`}><Plus size={14} /> Add campaigns</Link>
-      </div> : <div className="demo-notice"><LockKeyhole size={15}/><span>This sample is read-only. Create an account to build private brand memory.</span></div>}
+      </div> : <div className="demo-notice"><LockKeyhole size={15}/><span>This sample is read-only. Open the sample brief to see cited evidence, then create an account for a private workspace.</span>{sampleRecId && <Link className="primary" data-testid="dash-cta-sample" to={`/app/${orgId}/${brandId}/recommendations/${sampleRecId}`}>See sample recommendation <ArrowRight size={14}/></Link>}</div>}
       <section className="section">
         <h2>Recent memory</h2>
         <div className="library-grid">
@@ -554,16 +643,38 @@ function Campaigns() {
   const [list, setList] = useState([]);
   const [d, setD] = useState(null);
   const [err, setErr] = useState(null);
-  const reload = useCallback(() => {
-    api.get(`/brands/${brandId}/dashboard`).then(r => setD(r.data)).catch(e => setErr(e.response?.status));
-    api.get(`/brands/${brandId}/campaigns`).then(r => setList(r.data));
+  const reload = useCallback(async () => {
+    try {
+      const [dash, camps] = await Promise.all([
+        api.get(`/brands/${brandId}/dashboard`),
+        api.get(`/brands/${brandId}/campaigns`),
+      ]);
+      setD(dash.data);
+      setList(camps.data);
+      // Polling exists only to watch uploads finish. Once nothing is being
+      // processed there is nothing to wait for.
+      return (dash.data.readiness?.processing || 0) > 0;
+    } catch (e) {
+      setErr(e.response?.status || 0);
+      return false;  // a failing brand will not start working on retry
+    }
   }, [brandId]);
-  useEffect(() => { reload(); const id = setInterval(reload, 3500); return () => clearInterval(id); }, [reload]);
+  useEffect(() => {
+    let id;
+    let cancelled = false;
+    const tick = async () => {
+      const keepPolling = await reload();
+      if (!cancelled && keepPolling) id = setTimeout(tick, 3500);
+    };
+    tick();
+    return () => { cancelled = true; clearTimeout(id); };
+  }, [reload]);
   if (err === 403) return <Blocked />;
+  if (err) return <BrandGone status={err} />;
   if (!d) return <FullLoader />;
-  const isDemo = d.brand.name?.includes('Northstar');
+  const isDemo = isDemoWorkspace(d);
   return (
-    <Shell active="campaigns" brand={d.brand} org={d.brand} isDemo={isDemo}>
+    <Shell active="campaigns" brand={d.brand} org={d.organization || d.brand} isDemo={isDemo} sampleRecId={d.latest_recommendation?.id}>
       <Header eyebrow="MEMORY" title="Past work, kept in context." isDemo={isDemo} />
       <p className="page-sub">Every email keeps its objective, audience, and outcome attached. That&apos;s what makes recommendations trustworthy.</p>
       {!isDemo && <div className="add-sources">
@@ -636,52 +747,109 @@ function OutcomeForm({ campaignId, onDone, onCancel }) {
 }
 
 // ------------------------------------------------------------------ Brief
+// Mirrors CATEGORIES in backend/services/email_structure.py.
+const CATEGORY_OPTIONS = [
+  { value: 'activewear', label: 'Activewear' },
+  { value: 'supplements', label: 'Supplements' },
+  { value: 'beauty', label: 'Beauty & skincare' },
+  { value: 'food_beverage', label: 'Food & beverage' },
+  { value: 'apparel', label: 'Apparel' },
+  { value: 'home', label: 'Home' },
+  { value: 'electronics', label: 'Electronics' },
+  { value: 'saas', label: 'SaaS' },
+  { value: 'other', label: 'Other' },
+];
+
+const RUN_STEPS = [
+  { title: 'Read your description', detail: 'Objective, audience, and offer are pulled out of what you wrote.' },
+  { title: 'Search this brand’s memory', detail: 'Finds past sends with the closest copy, layout, and category.' },
+  { title: 'Assemble the structure', detail: 'Builds a block-by-block layout from patterns this brand already used.' },
+  { title: 'Run the hard rules', detail: 'Prohibited claims block the export. No exceptions.' },
+];
+
+const STAGE_LABELS = ['Build the structure', 'Reading your description…',
+  'Searching memory…', 'Assembling structure…'];
+
 function BriefNew() {
   const { orgId, brandId } = useParams();
   const [d, setD] = useState(null);
-  const [f, setF] = useState({ objective: '', audience: '', offer: '', constraints: '' });
+  const [f, setF] = useState({ name: '', title: '', description: '', category: '' });
   const [busy, setBusy] = useState(false);
+  const [stage, setStage] = useState(0);
   const navigate = useNavigate();
   useEffect(() => {
     api.get(`/brands/${brandId}/dashboard`).then(r => setD(r.data));
     try { const s = JSON.parse(localStorage.getItem(`bmos:brief:${brandId}`) || 'null'); if (s) setF(s); } catch (_e) { /* ignore */ }
   }, [brandId]);
   useEffect(() => { localStorage.setItem(`bmos:brief:${brandId}`, JSON.stringify(f)); }, [f, brandId]);
+  const ready = f.name.trim().length >= 2 && f.title.trim().length >= 2 && f.description.trim().length >= 10;
   const submit = async () => {
-    if (!f.objective || !f.audience || !f.offer) { toast.error('Fill objective, audience, and offer'); return; }
+    if (!ready) { toast.error('Add a name, a title, and a description of at least 10 characters'); return; }
     setBusy(true);
     try {
+      setStage(1);
       const brief = await api.post(`/brands/${brandId}/briefs`, f);
       if (brief.data.brief_violations?.length) {
-        toast.warning(`Your brief hits a hard rule: "${brief.data.brief_violations[0].rule}"`);
+        toast.warning(`Your description hits a hard rule: "${brief.data.brief_violations[0].rule}"`);
       }
+      setStage(2);
       const rec = await api.post(`/briefs/${brief.data.id}/recommendations`);
+      setStage(3);
       navigate(`/app/${orgId}/${brandId}/recommendations/${rec.data.id}`);
-    } catch (_e) { toast.error('Could not process brief'); }
+    } catch (_e) { toast.error('Could not process this campaign'); setStage(0); }
     finally { setBusy(false); }
   };
   if (!d) return <FullLoader />;
-  const isDemo = d.brand.name?.includes('Northstar');
+  const isDemo = isDemoWorkspace(d);
   return (
-    <Shell active="brief" brand={d.brand} org={d.brand} isDemo={isDemo}>
-      <Header eyebrow="NEW BRIEF" title="What are you making?" isDemo={isDemo} />
-      <p className="page-sub">The memory finds real evidence from past sends. Nothing invented.</p>
+    <Shell active="brief" brand={d.brand} org={d.organization || d.brand} isDemo={isDemo} sampleRecId={d.latest_recommendation?.id}>
+      <Header eyebrow="NEW CAMPAIGN" title="Name it, title it, describe it." isDemo={isDemo} />
+      <p className="page-sub">Three fields. Everything else is worked out from your description and this brand&apos;s own past sends.</p>
       <div className="brief-page">
         <div className="brief-form">
-          <label>Objective<input data-testid="brief-objective" value={f.objective} onChange={e => setF({ ...f, objective: e.target.value })} placeholder="Improve retention" /></label>
-          <label>Audience<input data-testid="brief-audience" value={f.audience} onChange={e => setF({ ...f, audience: e.target.value })} placeholder="Active subscribers" /></label>
-          <label>Offer / message<input data-testid="brief-offer" value={f.offer} onChange={e => setF({ ...f, offer: e.target.value })} placeholder="New seasonal roast" /></label>
-          <label>Constraints <small>optional</small><textarea data-testid="brief-constraints" value={f.constraints} onChange={e => setF({ ...f, constraints: e.target.value })} placeholder="No discounts, keep it editorial" /></label>
-          <button className="primary full" data-testid="brief-submit" onClick={submit} disabled={busy}>{busy ? 'Searching memory…' : 'Find evidence-backed direction'} <ArrowRight size={15} /></button>
+          <label>
+            <span className="field-step">1</span> Campaign name
+            <small>Internal label so you can find it later</small>
+            <input data-testid="brief-name" value={f.name} maxLength={120}
+              onChange={e => setF({ ...f, name: e.target.value })} placeholder="Autumn Roast Launch" />
+          </label>
+          <label>
+            <span className="field-step">2</span> Title
+            <small>One line on what this email is</small>
+            <input data-testid="brief-title" value={f.title} maxLength={200}
+              onChange={e => setF({ ...f, title: e.target.value })}
+              placeholder="Introduce the new seasonal roast to active subscribers" />
+          </label>
+          <label>
+            <span className="field-step">3</span> What do you want?
+            <small>Plain language. Say the goal, who it&apos;s for, and anything to avoid.</small>
+            <textarea data-testid="brief-description" value={f.description} rows={5} maxLength={2000}
+              onChange={e => setF({ ...f, description: e.target.value })}
+              placeholder="We're launching the autumn seasonal roast. I want an editorial email for active subscribers that teaches the flavour profile and drives one click to the product page. No discounts." />
+            <span className="char-count">{f.description.length}/2000</span>
+          </label>
+          <label>
+            Category <small>optional — sharpens which past designs get matched</small>
+            <select data-testid="brief-category" value={f.category}
+              onChange={e => setF({ ...f, category: e.target.value })}>
+              <option value="">Detect automatically</option>
+              {CATEGORY_OPTIONS.map(c => <option key={c.value} value={c.value}>{c.label}</option>)}
+            </select>
+          </label>
+          <button className="primary full" data-testid="brief-submit" onClick={submit} disabled={busy || !ready}>
+            {busy ? STAGE_LABELS[stage] : 'Build the structure'} <ArrowRight size={15} />
+          </button>
           <div className="autosave"><span className="saved-dot" /> Draft autosaves in this browser</div>
         </div>
         <aside className="brief-side">
-          <b>How this works</b>
-          <ol>
-            <li>Your brief is turned into a search vector.</li>
-            <li>It finds the closest past emails from this brand only.</li>
-            <li>OpenAI writes a grounded rationale, citing them by name.</li>
-            <li>Hard rules run last. If any hit, export is blocked.</li>
+          <b>What happens when you hit build</b>
+          <ol className="run-steps">
+            {RUN_STEPS.map((s, i) => (
+              <li key={i} className={busy && stage > i ? 'done' : busy && stage === i ? 'active' : ''}>
+                <b>{s.title}</b>
+                <span>{s.detail}</span>
+              </li>
+            ))}
           </ol>
           <div className="rules-preview">
             <small>ACTIVE HARD RULES (v{d.brand.active_guideline_version})</small>
@@ -707,14 +875,25 @@ function Recommendation() {
   const [rec, setRec] = useState(null);
   const [d, setD] = useState(null);
   const [exporting, setExporting] = useState(false);
+  const [copied, setCopied] = useState(false);
   useEffect(() => {
     api.get(`/recommendations/${recId}`).then(r => setRec(r.data));
     api.get(`/brands/${brandId}/dashboard`).then(r => setD(r.data));
   }, [recId, brandId]);
+  const copyStructure = async () => {
+    const text = (rec.recommended_structure || [])
+      .map(s => `${s.position}. ${s.label} — ${s.purpose}`)
+      .join('\n');
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (_e) { toast.error('Could not copy — select the blocks manually'); }
+  };
   const exportBp = async () => {
     setExporting(true);
     try {
-      const r = await api.post(`/recommendations/${recId}/blueprint`);
+      const r = await api.get(`/recommendations/${recId}/blueprint`);
       const blob = new Blob([r.data.markdown], { type: 'text/markdown' });
       const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
       a.download = 'campaign-blueprint.md'; a.click();
@@ -726,20 +905,22 @@ function Recommendation() {
     } finally { setExporting(false); }
   };
   if (!rec || !d) return <FullLoader />;
-  const isDemo = d.brand.name?.includes('Northstar');
+  const isDemo = isDemoWorkspace(d);
   const hasEvidence = rec.source_campaign_ids.length > 0;
   const strength = rec.evidence_strength;
   const strengthLabel = strength === 'strong' ? 'Strong evidence'
     : strength === 'moderate' ? 'Moderate evidence' : 'Needs more evidence';
   return (
-    <Shell active="brief" brand={d.brand} org={d.brand} isDemo={isDemo}>
+    <Shell active="brief" brand={d.brand} org={d.organization || d.brand} isDemo={isDemo} sampleRecId={d.latest_recommendation?.id || rec.id}>
       <Header eyebrow="RECOMMENDATION" title="Evidence-backed direction." isDemo={isDemo} />
       <div className="rec-page">
         <div className="rec-summary">
           <span className={`tag ${strength}`}>{strengthLabel}</span>
-          <span>Using rules v{rec.guideline_version}</span>
-          <span>{rec.source_campaign_ids.length} campaign(s) cited</span>
-          <span>Rationale by <b>{rec.rationale_model || 'deterministic only'}</b></span>
+          <span>Built from <b>{rec.source_campaign_ids.length}</b> of this brand&apos;s past emails</span>
+          <span>Checked against brand rules v{rec.guideline_version}</span>
+          <span>{rec.rationale_model && rec.rationale_model !== 'seeded-demo'
+            ? <>Explanation written by <b>{rec.rationale_model}</b></>
+            : <>Layout from your own sends — <b>no AI writing involved</b></>}</span>
           <button className="primary" data-testid="rec-export" onClick={exportBp} disabled={exporting || rec.rule_violations.length > 0 || !hasEvidence}>
             {exporting ? 'Preparing…' : rec.rule_violations.length ? 'Blocked' : !hasEvidence ? 'No evidence yet' : 'Export blueprint'} <Download size={14} />
           </button>
@@ -758,8 +939,70 @@ function Recommendation() {
         {!hasEvidence && (
           <div className="empty-panel" data-testid="rec-empty">
             <Lightbulb size={22} />
-            <h2>Nothing close enough in the memory.</h2>
-            <p>Rather than invent direction, we&apos;re showing nothing. Try a different audience or add a similar past campaign first.</p>
+            <h2>No past email was close enough to build from.</h2>
+            <p>
+              This brand&apos;s memory has nothing similar enough to this campaign, so rather
+              than invent a layout, we&apos;re showing you nothing. That&apos;s deliberate.
+            </p>
+            <div className="fix-list">
+              <b>Two ways to fix it:</b>
+              <ol>
+                <li>
+                  <b>Add more past emails.</b> Structure is read from HTML, so paste or sync
+                  real emails rather than screenshots — a handful is usually enough.
+                  <Link to={`/app/${orgId}/${brandId}/campaigns`}>Go to Memory <ArrowRight size={12} /></Link>
+                </li>
+                <li>
+                  <b>Describe it closer to something you&apos;ve sent.</b> Mention the product,
+                  the audience, and the goal in the same words your past emails use.
+                  <Link to={`/app/${orgId}/${brandId}/briefs/new`}>Rewrite the campaign <ArrowRight size={12} /></Link>
+                </li>
+              </ol>
+            </div>
+          </div>
+        )}
+        {(rec.recommended_structure || []).length > 0 && (
+          <div className="structure-panel" data-testid="rec-structure">
+            <div className="structure-head">
+              <div>
+                <b>Build this, top to bottom</b>
+                <p>
+                  Each block is a section of the email, in order. Every one of them comes from
+                  a real email this brand already sent — the names underneath say which.
+                  Recreate them in Figma, Klaviyo, or whatever you design in.
+                </p>
+              </div>
+              <div className="structure-actions">
+                <code className="signature">{rec.structure_signature}</code>
+                <button className="ghost tiny" data-testid="rec-copy-structure" onClick={copyStructure}>
+                  {copied ? <><Check size={12} /> Copied</> : <><ClipboardList size={12} /> Copy structure</>}
+                </button>
+              </div>
+            </div>
+            <ol className="structure-list">
+              {rec.recommended_structure.map(s => (
+                <li key={s.position} data-testid={`block-${s.block}`}>
+                  <span className="block-num">{String(s.position).padStart(2, '0')}</span>
+                  <div className="block-body">
+                    <b>{s.label}</b>
+                    <p>{s.purpose}</p>
+                    <span className="mini-label">
+                      Used in {s.evidence_count} cited send{s.evidence_count === 1 ? '' : 's'}
+                      {(s.grounded_in || []).length > 0 && `: ${s.grounded_in.map(g => g.name).join(', ')}`}
+                    </span>
+                  </div>
+                </li>
+              ))}
+            </ol>
+          </div>
+        )}
+        {hasEvidence && (rec.recommended_structure || []).length === 0 && (
+          <div className="conflict-panel" data-testid="rec-no-structure">
+            <AlertTriangle size={16} />
+            <div>
+              <b>No layout could be grounded in past sends.</b>
+              <p>The cited campaigns have no readable HTML structure. Sync or paste a few emails with their HTML, then re-run this campaign.</p>
+            </div>
           </div>
         )}
         {rec.rationale && (
@@ -787,6 +1030,9 @@ function Recommendation() {
               </div>
               <div className="evidence-copy">
                 <span className="mini-label">Audience: {e.campaign.audience || 'TBD'}</span>
+                {e.campaign.module_signature && (
+                  <span className="mini-label">Layout: <code>{e.campaign.module_signature}</code></span>
+                )}
                 <p>{(e.campaign.extracted?.summary || '').slice(0, 260)}</p>
                 <div className="metrics">
                   {e.campaign.metrics?.open ? (
@@ -833,20 +1079,21 @@ function GuidelinesPage() {
     } catch (e) { toast.error(e.response?.data?.detail || 'Research could not be applied'); }
   };
   if (!d || !g) return <FullLoader />;
-  const isDemo = d.brand.name?.includes('Northstar');
+  const isDemo = isDemoWorkspace(d);
   return (
     <Shell active="guidelines" brand={d.brand} org={d.organization} isDemo={isDemo}>
       <Header eyebrow="RULES" title="The guardrails behind every recommendation." isDemo={isDemo} />
       <p className="page-sub">Prohibited claims are hard rules — they block export. Everything else is guidance.</p>
-      {research?.status === 'awaiting_review' && <div className="research-review"><ResearchSummary research={research}/><div><b>Human approval required</b><p>Review the cited report before merging its voice, claim, and layout candidates into a new immutable rules version.</p><button className="outline" onClick={approveResearch}>Approve reviewed candidates</button></div></div>}
+      {isDemo && <div className="demo-notice"><LockKeyhole size={15}/><span>Sample rules are read-only. Create an account to set your own immutable versions.</span></div>}
+      {research?.status === 'awaiting_review' && !isDemo && <div className="research-review"><ResearchSummary research={research}/><div><b>Human approval required</b><p>Review the cited report before merging its voice, claim, and layout candidates into a new immutable rules version.</p><button className="outline" onClick={approveResearch}>Approve reviewed candidates</button></div></div>}
       <div className="memory-grid">
-        <ChipsField label="Voice & tone" testid="g-tone" items={g.tone || []} onChange={v => setG({ ...g, tone: v })} placeholder="warm, quietly confident…" />
-        <ChipsField label="Approved claims" testid="g-approved" items={g.approved_claims || []} onChange={v => setG({ ...g, approved_claims: v })} placeholder="small-batch roasted…" />
-        <ChipsField label="Prohibited claims" testid="g-prohibited" danger items={g.prohibited_claims || []} onChange={v => setG({ ...g, prohibited_claims: v })} placeholder="detox, cures anxiety…" />
-        <ChipsField label="Layout rules" testid="g-layout" items={g.layout_rules || []} onChange={v => setG({ ...g, layout_rules: v })} placeholder="single primary CTA…" />
+        <ChipsField label="Voice & tone" testid="g-tone" items={g.tone || []} onChange={v => setG({ ...g, tone: v })} placeholder="warm, quietly confident…" readOnly={isDemo} />
+        <ChipsField label="Approved claims" testid="g-approved" items={g.approved_claims || []} onChange={v => setG({ ...g, approved_claims: v })} placeholder="small-batch roasted…" readOnly={isDemo} />
+        <ChipsField label="Prohibited claims" testid="g-prohibited" danger items={g.prohibited_claims || []} onChange={v => setG({ ...g, prohibited_claims: v })} placeholder="detox, cures anxiety…" readOnly={isDemo} />
+        <ChipsField label="Layout rules" testid="g-layout" items={g.layout_rules || []} onChange={v => setG({ ...g, layout_rules: v })} placeholder="single primary CTA…" readOnly={isDemo} />
       </div>
-      <label className="wide">CTA style<input data-testid="g-cta" value={g.cta_style || ''} onChange={e => setG({ ...g, cta_style: e.target.value })} /></label>
-      <button className="primary" data-testid="g-save" onClick={save}>Save new version <Check size={14} /></button>
+      <label className="wide">CTA style<input data-testid="g-cta" value={g.cta_style || ''} onChange={e => setG({ ...g, cta_style: e.target.value })} disabled={isDemo} /></label>
+      {!isDemo && <button className="primary" data-testid="g-save" onClick={save}>Save new version <Check size={14} /></button>}
     </Shell>
   );
 }
@@ -856,7 +1103,7 @@ function DemoRedirect() {
   const [target, setTarget] = useState(null);
   useEffect(() => { api.get('/demo').then(r => { localStorage.setItem('bmos:demo', 'true'); setTarget(r.data); }).catch(() => setTarget(false)); }, []);
   if (target === null) return <FullLoader />;
-  if (target === false) return <div className="landing"><div className="landing-copy"><h1>Demo unavailable</h1><Link to="/">Back</Link></div></div>;
+  if (target === false) return <div className="landing"><div className="landing-copy"><h1>Demo unavailable</h1><p>The API on port 8000 is down or Mongo has not seeded yet. Start the backend, then retry.</p><Link className="primary large" to="/">Back</Link></div></div>;
   return <Navigate to={`/app/${target.org_id}/${target.brand_id}/dashboard`} replace />;
 }
 
@@ -886,6 +1133,23 @@ function EmptyPanel({ title, body }) {
 
 function FullLoader() {
   return <div className="full-loader" data-testid="full-loader"><Loader2 size={28} className="spin" /><span>Loading…</span></div>;
+}
+
+function BrandGone({ status }) {
+  return (
+    <div className="landing">
+      <div className="landing-copy">
+        <div className="brand-mark dark"><span>BM</span><b>Brand Memory</b></div>
+        <h1>{status === 404 ? 'This brand no longer exists.' : 'We could not load this brand.'}</h1>
+        <p>
+          {status === 404
+            ? 'The link points at a brand that has been removed, or belongs to a workspace you left.'
+            : 'The API did not respond. Check that the backend is running, then try again.'}
+        </p>
+        <Link className="primary large" to="/">Back to start <ArrowLeft size={14} /></Link>
+      </div>
+    </div>
+  );
 }
 
 function Blocked() {
