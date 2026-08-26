@@ -36,6 +36,14 @@ def test_demo_is_explicitly_read_only():
     demo = requests.get(f"{BASE}/demo", timeout=30).json()
     headers = {"X-Demo-Access": "read-only"}
     assert requests.get(f"{BASE}/brands/{demo['brand_id']}/dashboard", headers=headers, timeout=30).status_code == 200
+    dash = requests.get(f"{BASE}/brands/{demo['brand_id']}/dashboard", headers=headers, timeout=30).json()
+    assert dash.get("is_demo") is True
+    assert dash.get("latest_recommendation"), "demo should seed a sample recommendation"
+    rec_id = dash["latest_recommendation"]["id"]
+    assert requests.get(f"{BASE}/recommendations/{rec_id}", headers=headers, timeout=30).status_code == 200
+    blueprint = requests.get(f"{BASE}/recommendations/{rec_id}/blueprint", headers=headers, timeout=30)
+    assert blueprint.status_code == 200
+    assert "Campaign blueprint" in blueprint.json()["markdown"]
     assert requests.patch(
         f"{BASE}/brands/{demo['brand_id']}/guidelines", headers=headers,
         json={"tone": [], "approved_claims": [], "prohibited_claims": [], "colors": [], "layout_rules": [], "cta_style": ""}, timeout=30,

@@ -101,3 +101,83 @@
 #====================================================================================================
 # Testing Data - Main Agent and testing sub agent both should log testing data below this section
 #====================================================================================================
+
+user_problem_statement: "Use brand-memory-os-updated.zip and implement the changes mentioned there for an Emergent Builder Fest hackathon."
+
+backend:
+  - task: "Hardened auth, CSRF, tenant isolation, demo read-only"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Zip changelog already present. Added GET blueprint for demo, seeded sample recommendation, Emergent LLM proxy fallback, CORS DELETE, dashboard org/is_demo/full counts."
+  - task: "Brand research agent chain + SSRF + human approval"
+    implemented: true
+    working: true
+    file: "backend/services/brand_research.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Agents SDK retained; Chat Completions fallback when Responses/Agents fail on Emergent proxy. OPENAI_API_KEY or EMERGENT_LLM_KEY."
+  - task: "Native Klaviyo/Mailchimp connections"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Backend encrypts keys and syncs last 5 campaigns. CORS now allows DELETE disconnect. Frontend modal added."
+
+frontend:
+  - task: "Five-step onboarding and workspace UI"
+    implemented: true
+    working: true
+    file: "frontend/src/App.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "is_demo from API, sample brief nav, read-only rules in demo, GET blueprint export."
+  - task: "Provider connect UI (Klaviyo/Mailchimp API + paste)"
+    implemented: true
+    working: true
+    file: "frontend/src/App.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Native API-key connect/sync/disconnect plus paste HTML tab. Other providers remain paste-only."
+
+metadata:
+  created_by: "main_agent"
+  version: "1.0"
+  test_sequence: 1
+  run_ui: true
+
+test_plan:
+  current_focus:
+    - "Hardened auth, CSRF, tenant isolation, demo read-only"
+    - "Provider connect UI (Klaviyo/Mailchimp API + paste)"
+    - "Five-step onboarding and workspace UI"
+  stuck_tasks: []
+  test_all: true
+  test_priority: "high_first"
+
+agent_communication:
+  - agent: "main"
+    message: "Implemented zip changelog plus Emergent-hosted LLM fallback, demo walkthrough (seeded rec + GET blueprint), and native Klaviyo/Mailchimp UI. Unit tests added for SSRF and LLM key detection. Please verify landing → demo dashboard → sample rec → export → rules; then register → onboarding → paste/connect."
